@@ -39,8 +39,28 @@ const RTV_RING: u32 = 1024;
 /// Maximum number of detached host lists kept for reuse after pending resets.
 const LIST_POOL_CAP: usize = 64;
 
+/// Maximum reusable readback buffer kept cached for ReBAR UAV copy-backs.
+/// One-off readbacks larger than this are dropped right after use.
+const REBAR_READBACK_KEEP_CAP: u64 = 256 << 20;
+
+/// Reusable command list and readback buffer for DMAing GPU-written ranges of
+/// ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) shadow buffers into cached system RAM.
+#[derive(Default)]
+struct RebarReadback {
+    list: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    buffer: Option<(ID3D12Resource, usize, u64)>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the mapped pointer is read only
+// under `Host::rebar_readback` after the copy fence has completed.
+unsafe impl Send for RebarReadback {}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    adapter: Option<IDXGIAdapter3>,
+    rebar_scratch: bool,
+    rebar_shadow_budget: u64,
+    rebar_readback: Mutex<RebarReadback>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -363,6 +383,7 @@ fn create() -> windows::core::Result<Host> {
         }
         let mut device: Option<ID3D12Device> = None;
         let mut chosen: Option<DXGI_ADAPTER_DESC1> = None;
+        let mut adapter3: Option<IDXGIAdapter3> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
@@ -377,6 +398,7 @@ fn create() -> windows::core::Result<Host> {
             match pick_hardware_adapter(filter.as_deref()) {
                 Ok((adapter, desc)) => {
                     D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    adapter3 = adapter.cast::<IDXGIAdapter3>().ok();
                     chosen = Some(desc);
                 }
                 Err(e) if filter.is_some() => return Err(e),
@@ -386,6 +408,32 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+        let uma = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_ARCHITECTURE1,
+                (&raw mut arch).cast(),
+                size_of::<D3D12_FEATURE_DATA_ARCHITECTURE1>() as u32,
+            )
+            .is_ok()
+            && arch.UMA.as_bool();
+        let mut opt16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut opt16).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32,
+            )
+            .is_ok()
+            && opt16.GPUUploadHeapSupported.as_bool();
+        let local_vram_budget = adapter3
+            .as_ref()
+            .and_then(query_local_vram_budget)
+            .or_else(|| chosen.map(|d| d.DedicatedVideoMemory as u64));
+        let allow_rebar = !cfg!(feature = "diagnostics")
+            || std::env::var_os("VICTORY_REBAR").is_none_or(|v| v != "0");
+        let (rebar_scratch, rebar_shadow_budget) =
+            rebar_policy(gpu_upload_supported, uma, local_vram_budget, allow_rebar);
         #[cfg(feature = "diagnostics")]
         if debug
             && crate::switch::on("VICTORY_D3D12_GBV")
@@ -431,13 +479,27 @@ fn create() -> windows::core::Result<Host> {
                 vendor = format_args!("{:#06x}", desc.VendorId),
                 device = format_args!("{:#06x}", desc.DeviceId),
                 vram_mb = desc.DedicatedVideoMemory >> 20,
+                gpu_upload_supported,
+                uma,
+                rebar_scratch,
+                rebar_shadow_budget_mb = rebar_shadow_budget >> 20,
                 "host D3D12 device ready"
             );
         } else {
-            tracing::info!("host D3D12 device ready");
+            tracing::info!(
+                gpu_upload_supported,
+                uma,
+                rebar_scratch,
+                rebar_shadow_budget_mb = rebar_shadow_budget >> 20,
+                "host D3D12 device ready"
+            );
         }
         Ok(Host {
             device,
+            adapter: adapter3,
+            rebar_scratch,
+            rebar_shadow_budget,
+            rebar_readback: Mutex::default(),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -1006,7 +1068,7 @@ impl Host {
             #[cfg(test)]
             let _scope = enter_retire_scope(exec_scope.clone());
             for list in runs {
-                list.run_deferred(&mut batch);
+                list.run_deferred(&mut batch, self, &mut submitted);
                 firsts.push(lists.len());
                 if let Some(prelude) = list.prelude() {
                     lists.push(Some(prelude));
@@ -1119,9 +1181,76 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        struct RebarPending {
+            shadow: std::sync::Arc<crate::shadow::Shadow>,
+            ranges: Vec<(usize, usize)>,
+        }
+        struct RebarMerged {
+            shadow: std::sync::Arc<crate::shadow::Shadow>,
+            spans: Vec<(usize, usize)>,
+            first: usize,
+            end: usize,
+        }
+        let mut rebar_writes: Vec<RebarPending> = Vec::new();
         for (shadow, address, len) in batch.gpu_writes {
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            if shadow.is_rebar() {
+                let (from, to) = shadow.inside(address, len);
+                match rebar_writes
+                    .iter_mut()
+                    .find(|p| std::sync::Arc::ptr_eq(&p.shadow, &shadow))
+                {
+                    Some(entry) => {
+                        if from < to {
+                            entry.ranges.push((from, to));
+                        }
+                    }
+                    None => {
+                        let ranges = if from < to {
+                            vec![(from, to)]
+                        } else {
+                            Vec::new()
+                        };
+                        rebar_writes.push(RebarPending { shadow, ranges });
+                    }
+                }
+            } else {
+                let written = shadow.copy_back(address, len);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
+        }
+        if !rebar_writes.is_empty() {
+            let mut merged: Vec<RebarMerged> = Vec::with_capacity(rebar_writes.len());
+            let mut total_jobs = 0usize;
+            for entry in rebar_writes {
+                let spans = merge_ranges(entry.ranges);
+                let first = total_jobs;
+                total_jobs += spans.len();
+                merged.push(RebarMerged {
+                    shadow: entry.shadow,
+                    spans,
+                    first,
+                    end: total_jobs,
+                });
+            }
+            let mut copy_jobs: Vec<(&ID3D12Resource, u64, u64)> = Vec::with_capacity(total_jobs);
+            for entry in &merged {
+                for &(from, to) in &entry.spans {
+                    copy_jobs.push((&entry.shadow.buffer, from as u64, (to - from) as u64));
+                }
+            }
+            let ok = self.copy_rebar_readback(&mut submitted, &copy_jobs, |slices| {
+                for entry in &merged {
+                    let written = entry
+                        .shadow
+                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end]);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                }
+            });
+            if !ok {
+                for entry in &merged {
+                    entry.shadow.clear_pending_rebar();
+                }
+            }
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
@@ -2030,7 +2159,7 @@ impl HostList {
         let host = host()?;
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = host.scratch_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2043,7 +2172,7 @@ impl HostList {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+            let (buffer, data) = host.scratch_buffer(SCRATCH_CHUNK)?;
             name(&buffer, || "list scratch".into());
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2215,7 +2344,7 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, host: &Host, submitted: &mut u64) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -2268,7 +2397,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    batch.gpu_write(shadow, *address, *len);
+                    batch.gpu_write(host, submitted, shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -2309,6 +2438,8 @@ impl Batch {
 
     fn gpu_write(
         &mut self,
+        host: &Host,
+        submitted: &mut u64,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
@@ -2318,7 +2449,9 @@ impl Batch {
             // Another declaration of this exact range is already pending until
             // the GPU submission finishes, so it needs no refresh boundary.
             self.flush();
-            shadow.writing(address, len);
+            shadow.writing(address, len, |buffer, size| {
+                host.readback_rebar_to_vec(submitted, buffer, size)
+            });
             self.gpu_writes.push((shadow.clone(), address, len));
         }
     }
@@ -2690,7 +2823,357 @@ mod title_copies {
     }
 }
 
+/// Queries the adapter's current local VRAM budget in bytes via DXGI.
+fn query_local_vram_budget(adapter: &IDXGIAdapter3) -> Option<u64> {
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: valid adapter and output struct.
+    unsafe {
+        adapter
+            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+            .ok()?;
+    }
+    (info.Budget > 0).then_some(info.Budget)
+}
+
+/// Decides `(rebar_scratch_enabled, rebar_shadow_budget_bytes)` for the active
+/// adapter.
+///
+/// - Disabled when `allow_rebar` is false (`VICTORY_REBAR=0` in diagnostics
+///   builds), when the adapter/driver does not support `D3D12_HEAP_TYPE_GPU_UPLOAD`,
+///   or on UMA/APU adapters (where `L0` write-back `shared_buffer` already lives
+///   in unified local memory without write-combining read penalties).
+/// - On discrete GPUs with ReBAR support, scales the shadow VRAM budget by local
+///   VRAM so low-VRAM cards (`<= 8 GiB`) stay safely on system-RAM shadows while
+///   12–32+ GiB cards keep hot buffers resident in VRAM.
+fn rebar_policy(
+    gpu_upload_supported: bool,
+    uma: bool,
+    local_vram_budget: Option<u64>,
+    allow_rebar: bool,
+) -> (bool, u64) {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if !allow_rebar || !gpu_upload_supported || uma {
+        return (false, 0);
+    }
+    let Some(budget) = local_vram_budget else {
+        return (false, 0);
+    };
+    if budget <= 8 * GIB {
+        (false, 0)
+    } else if budget <= 14 * GIB {
+        (true, 512 * MIB)
+    } else if budget < 20 * GIB {
+        (true, 2 * GIB)
+    } else {
+        (true, (budget / 4).min(8 * GIB))
+    }
+}
+
+/// Merges overlapping or adjacent half-open byte intervals `[from, to)` into
+/// sorted disjoint intervals.
+fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|&(from, to)| from < to);
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
+}
+
 impl Host {
+    /// Local and non-local video memory `[local_budget, local_usage, shared_budget, shared_usage]`
+    /// in bytes, or `None` on adapters without `IDXGIAdapter3` (e.g. WARP).
+    pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
+        let adapter = self.adapter.as_ref()?;
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: valid adapter and output structs.
+        unsafe {
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)
+                .ok()?;
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
+                .ok()?;
+        }
+        Some([
+            local.Budget,
+            local.CurrentUsage,
+            shared.Budget,
+            shared.CurrentUsage,
+        ])
+    }
+
+    /// Whether allocating `extra_bytes` of local VRAM stays under 85% of the
+    /// adapter's current local VRAM budget (leaves headroom for textures and
+    /// render targets).
+    fn has_vram_headroom(&self, extra_bytes: u64) -> bool {
+        let Some([budget, used, ..]) = self.video_memory() else {
+            return true;
+        };
+        if budget == 0 {
+            return false;
+        }
+        let limit = (budget / 100).saturating_mul(85);
+        used.saturating_add(extra_bytes) <= limit
+    }
+
+    /// Byte budget reserved for ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) shadow
+    /// buffers on this adapter (0 when ReBAR shadows are disabled).
+    pub(crate) fn rebar_shadow_budget(&self) -> u64 {
+        self.rebar_shadow_budget
+    }
+
+    /// A buffer in `D3D12_HEAP_TYPE_GPU_UPLOAD` (CPU-writable local VRAM via
+    /// Resizable BAR), starting in `COMMON` and mapped for sequential CPU
+    /// writes. Callers MUST NOT read from the returned pointer on the CPU.
+    fn gpu_upload_buffer(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-writable VRAM buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        error = %e,
+                        size,
+                        "GPU upload heap allocation failed; falling back to system memory"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// A scratch buffer for write-only per-draw host data: placed in
+    /// `D3D12_HEAP_TYPE_GPU_UPLOAD` when ReBAR is enabled and VRAM has
+    /// headroom, otherwise falls back to standard `D3D12_HEAP_TYPE_UPLOAD`.
+    pub(crate) fn scratch_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if self.rebar_scratch
+            && self.has_vram_headroom(size)
+            && let Some(buf) = self.gpu_upload_buffer(size, D3D12_RESOURCE_FLAG_NONE)
+        {
+            return Some(buf);
+        }
+        self.upload_buffer(size)
+    }
+
+    /// Attempts to allocate a UAV-capable ReBAR shadow buffer in local VRAM.
+    /// Returns `None` if ReBAR shadows are disabled, VRAM headroom is low, or
+    /// allocation fails (callers fall back to [`Host::shared_buffer`]).
+    pub(crate) fn try_rebar_shadow_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if self.rebar_shadow_budget == 0 || !self.has_vram_headroom(size) {
+            return None;
+        }
+        self.gpu_upload_buffer(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    }
+
+    /// DMAs `copies` (`(src_buffer, src_offset, len)`) from ReBAR buffers into
+    /// a cached system-RAM readback buffer on `self.queue`, waits for `submitted`
+    /// (already locked by the caller), and invokes `f` with the resulting slices.
+    fn copy_rebar_readback(
+        &self,
+        submitted: &mut u64,
+        copies: &[(&ID3D12Resource, u64, u64)],
+        f: impl FnOnce(&[&[u8]]),
+    ) -> bool {
+        if copies.is_empty() {
+            f(&[]);
+            return true;
+        }
+        let mut total: u64 = 0;
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(copies.len());
+        for &(_, _, len) in copies {
+            let Some(end) = total.checked_add(len) else {
+                return false;
+            };
+            offsets.push((total as usize, len as usize));
+            total = end;
+        }
+        if total == 0 {
+            let empty: Vec<&[u8]> = vec![&[]; copies.len()];
+            f(&empty);
+            return true;
+        }
+        let mut rb = self
+            .rebar_readback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if rb.list.is_none() {
+            // SAFETY: valid device creating a direct allocator and closed list.
+            let created = unsafe {
+                (|| -> windows::core::Result<_> {
+                    let allocator: ID3D12CommandAllocator = self
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                })()
+            };
+            match created {
+                Ok(pair) => rb.list = Some(pair),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not create ReBAR readback command list");
+                    return false;
+                }
+            }
+        }
+        let mut transient: Option<(ID3D12Resource, *const u8)> = None;
+        let (dst_res, dst_ptr): (ID3D12Resource, *const u8) = if total > REBAR_READBACK_KEEP_CAP {
+            let Some((buf, ptr)) = self.readback_buffer(total) else {
+                return false;
+            };
+            transient = Some((buf.clone(), ptr));
+            (buf, ptr)
+        } else {
+            let need_new = rb.buffer.as_ref().is_none_or(|(_, _, cap)| *cap < total);
+            if need_new {
+                let cap = total
+                    .next_power_of_two()
+                    .clamp(1 << 20, REBAR_READBACK_KEEP_CAP);
+                let Some((buf, ptr)) = self.readback_buffer(cap) else {
+                    return false;
+                };
+                name(&buf, || format!("ReBAR readback {cap:#x}"));
+                rb.buffer = Some((buf, ptr as usize, cap));
+            }
+            let (buf, ptr, _) = rb.buffer.as_ref().unwrap();
+            (buf.clone(), *ptr as *const u8)
+        };
+        let (allocator, list) = rb.list.as_ref().unwrap();
+        // SAFETY: `submitted` is held exclusively so no previous readback is in
+        // flight; all source buffers are in COMMON state (implicitly promoting
+        // to COPY_SOURCE and decaying back to COMMON on completion), and
+        // `dst_res` is a READBACK buffer in COPY_DEST state covering `total`.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                for (&(src, src_off, len), &(dst_off, _)) in copies.iter().zip(&offsets) {
+                    if len > 0 {
+                        list.CopyBufferRegion(&dst_res, dst_off as u64, src, src_off, len);
+                    }
+                }
+                list.Close()?;
+                Ok(())
+            })()
+        };
+        if let Err(e) = recorded {
+            tracing::warn!(error = %e, "could not record ReBAR readback list");
+            drop(transient);
+            return false;
+        }
+        let Ok(cmd): windows::core::Result<ID3D12CommandList> = list.cast() else {
+            drop(transient);
+            return false;
+        };
+        *submitted += 1;
+        // SAFETY: `cmd` is closed; `fence` and `event` are owned by `self` and
+        // serialized under `submitted`.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+            match self.queue.Signal(&self.fence, *submitted) {
+                Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    Ok(()) => {
+                        let waited = WaitForSingleObject(self.event, INFINITE);
+                        if waited != WAIT_OBJECT_0 {
+                            self.poll_fence(*submitted);
+                        }
+                    }
+                    Err(_) => self.poll_fence(*submitted),
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "ReBAR readback fence signal failed");
+                    drop(transient);
+                    return false;
+                }
+            }
+        }
+        let slices: Vec<&[u8]> = offsets
+            .iter()
+            .map(|&(off, len)| {
+                // SAFETY: GPU copy completed and `dst_ptr` covers `total` bytes.
+                unsafe { std::slice::from_raw_parts(dst_ptr.add(off), len) }
+            })
+            .collect();
+        f(&slices);
+        drop(transient);
+        true
+    }
+
+    /// Reads the entire ReBAR shadow buffer into a cached system-RAM `Vec<u8>`
+    /// once, on its first UAV write, without ever reading write-combining memory
+    /// from the CPU.
+    fn readback_rebar_to_vec(
+        &self,
+        submitted: &mut u64,
+        buffer: &ID3D12Resource,
+        size: u64,
+    ) -> Option<Vec<u8>> {
+        if size == 0 {
+            return Some(Vec::new());
+        }
+        let mut out = None;
+        let ok = self.copy_rebar_readback(submitted, &[(buffer, 0, size)], |slices| {
+            out = Some(slices[0].to_vec());
+        });
+        ok.then_some(out).flatten()
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -4121,7 +4604,7 @@ fn wave32_supported(wave_ops: bool, min: u32, max: u32) -> bool {
 
 #[cfg(test)]
 mod wave_tests {
-    use super::wave32_supported;
+    use super::{merge_ranges, rebar_policy, wave32_supported};
 
     #[test]
     fn wave32_support_matches_adapter_lane_range() {
@@ -4131,5 +4614,69 @@ mod wave_tests {
         assert!(wave32_supported(true, 4, 128)); // WARP
         assert!(!wave32_supported(true, 64, 64)); // Wave64-only (GCN/Vega)
         assert!(!wave32_supported(false, 32, 32)); // No wave ops
+    }
+
+    #[test]
+    fn rebar_policy_handles_all_hardware_tiers_and_fallbacks() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+
+        // Non-ReBAR, WARP, UMA/APU, or explicitly disabled always stay off.
+        assert_eq!(rebar_policy(false, false, Some(32 * GIB), true), (false, 0));
+        assert_eq!(rebar_policy(true, true, Some(64 * GIB), true), (false, 0));
+        assert_eq!(rebar_policy(true, false, Some(32 * GIB), false), (false, 0));
+        assert_eq!(rebar_policy(true, false, None, true), (false, 0));
+
+        // Low-VRAM discrete GPUs (<= 8 GiB) stay on system-RAM shadows.
+        assert_eq!(rebar_policy(true, false, Some(4 * GIB), true), (false, 0));
+        assert_eq!(rebar_policy(true, false, Some(8 * GIB), true), (false, 0));
+
+        // 12 GiB tier: conservative 512 MiB shadow budget.
+        assert_eq!(
+            rebar_policy(true, false, Some(12 * GIB), true),
+            (true, 512 * MIB)
+        );
+        assert_eq!(
+            rebar_policy(true, false, Some(14 * GIB), true),
+            (true, 512 * MIB)
+        );
+
+        // 16 GiB tier: 2 GiB shadow budget.
+        assert_eq!(
+            rebar_policy(true, false, Some(16 * GIB), true),
+            (true, 2 * GIB)
+        );
+
+        // 20–32+ GiB tier: 25% of local VRAM budget capped at 8 GiB.
+        assert_eq!(
+            rebar_policy(true, false, Some(20 * GIB), true),
+            (true, 5 * GIB)
+        );
+        assert_eq!(
+            rebar_policy(true, false, Some(24 * GIB), true),
+            (true, 6 * GIB)
+        );
+        assert_eq!(
+            rebar_policy(true, false, Some(32 * GIB), true),
+            (true, 8 * GIB)
+        );
+        assert_eq!(
+            rebar_policy(true, false, Some(48 * GIB), true),
+            (true, 8 * GIB)
+        );
+    }
+
+    #[test]
+    fn merge_ranges_coalesces_overlapping_and_adjacent_spans() {
+        assert_eq!(merge_ranges(vec![]), vec![]);
+        assert_eq!(merge_ranges(vec![(10, 10), (20, 15)]), vec![]);
+        assert_eq!(
+            merge_ranges(vec![(100, 200), (0, 50), (50, 120), (300, 400)]),
+            vec![(0, 200), (300, 400)]
+        );
+        assert_eq!(
+            merge_ranges(vec![(0, 100), (10, 40), (20, 90)]),
+            vec![(0, 100)]
+        );
     }
 }
