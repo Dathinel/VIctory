@@ -281,6 +281,69 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compare_cache_write_failure_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let cache = Cache::open(&root).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::write(&root, b"cache path is a file").unwrap();
+        let build = [7; 32];
+
+        let calls = AtomicU64::new(0);
+        let stable = cached(&cache, &build, b"stable", |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        });
+        assert!(stable.as_ref().map_or(true, |s| *s == shader()));
+        println!(
+            "stable_ok={} calls={}",
+            stable.is_ok(),
+            calls.load(Ordering::Relaxed)
+        );
+
+        let calls = AtomicU64::new(0);
+        let once = cached(&cache, &build, b"once", |_| {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(shader())
+            } else {
+                Err("second conversion".to_owned())
+            }
+        });
+        assert!(once.as_ref().map_or(true, |s| *s == shader()));
+        println!(
+            "once_ok={} calls={} second_error={}",
+            once.is_ok(),
+            calls.load(Ordering::Relaxed),
+            once.as_ref()
+                .is_err_and(|e| e.contains("second conversion"))
+        );
+
+        let calls = AtomicU64::new(0);
+        let error = cached(&cache, &build, b"unsupported", |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err("synthetic unsupported shader".to_owned())
+        })
+        .unwrap_err();
+        assert!(error.contains("synthetic unsupported shader"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        std::fs::remove_file(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let calls = AtomicU64::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                cached(&cache, &build, b"stable", |_| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(shader())
+                }),
+                Ok(shader())
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        println!("translation_error_preserved=true recovered=true hit=true");
+    }
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
