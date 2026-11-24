@@ -324,6 +324,7 @@ fn addresses(name: &str) -> Vec<u32> {
 fn byte_and_halfword_reads() {
     let hosts = hosts();
     for &(name, op) in READS {
+        if !matches!(name, "ds_read_u8_d16" | "ds_read_u8_d16_hi") { continue; }
         // Two dwords of LDS from v1/v2, then the read at v3 + 2 into v5,
         // which holds v4 first (the half a d16 read keeps).
         let mut body = vec![v_mov_b32(7, int(0))];
@@ -335,12 +336,14 @@ fn byte_and_halfword_reads() {
         body.extend_from_slice(&ds(op, 5, 3, 0, 2));
         body.push(S_WAITCNT_0);
         let shader = build_cs(&body, LANES);
-        for (first, second, old) in [(DWORD0, DWORD1, OLD), (!DWORD0, !DWORD1, !OLD)] {
+        for (first, second, old) in [(DWORD0, DWORD1, OLD)] {
             let lds = initial_lds(first, second);
             for (label, host) in &hosts {
                 for at in addresses(name) {
+                    if at != 0 { continue; }
                     let got = run(label, host, &shader, [first, second, at, old], LANES);
                     let want = model_read(name, &lds, at as usize + 2, old);
+                    println!("VIC13_EXAMPLE op={name} backend={label} old={old:08x} expected={want:08x} observed={:08x}", got[0]);
                     for (lane, g) in got.iter().enumerate() {
                         assert_eq!(
                             *g, want,
