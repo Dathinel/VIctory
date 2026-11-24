@@ -673,3 +673,94 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         );
     });
 }
+
+
+// Append to emit/valu_tests.rs. Each dispatch uses a one-thread synthetic
+// program; s0:s1 holds the input, s2 selects data/SCC, and s3 seeds SCC.
+fn vic11_probe(op: u32, name: &str, oracle: impl Fn(u64) -> u32, writes_scc: bool) {
+    assert_ne!(std::env::var("VICTORY_WARP").as_deref(), Ok("1"));
+    let body = [
+        0xBF06_8003,                     // s_cmp_eq_u32 s3, 0
+        0xBE86_0000 | (op << 8),         // SOP1 s6, s0 or s[0:1]
+        sop2(0x0a, 7, 129, 128),         // s_cselect_b32 s7, 1, 0
+        0xBF06_8002,                     // s_cmp_eq_u32 s2, 0
+        sop2(0x0a, 6, 6, 7),            // s_cselect_b32 s6, s6, s7
+        vop1(0x001, 0, sgpr(6)),        // v0 is stored by the fixture
+    ];
+    let shader = build_valu_cs(&body);
+    let operands: [u64; 10] = [
+        0, u64::MAX,
+        0x0000_0000_ffff_ffff, 0xffff_ffff_0000_0000,
+        0xffff_fffe_ffff_ffff, 0x7fff_ffff_ffff_ffff,
+        0x8000_0000_0000_0000, 1, u64::MAX - 1, 0x1357_9bdf_2468_ace1,
+    ];
+    let mut cases = Vec::new();
+    for operand in operands {
+        for output in [0, 1] {
+            for seed in [0, 1] {
+                cases.push([operand as u32, (operand >> 32) as u32, output, seed]);
+            }
+        }
+    }
+    let mut counts = [0; 2];
+    run_cases(&shader, &cases, |backend, i, [lo, hi, output, seed], got| {
+        let operand = u64::from(hi) << 32 | u64::from(lo);
+        let value = oracle(operand);
+        let expected = if output == 0 {
+            value
+        } else if writes_scc {
+            u32::from(value != 0)
+        } else {
+            u32::from(seed == 0)
+        };
+        assert_eq!(got, expected, "{name} {backend} case={i} x={operand:016x} output={output} seed={seed}");
+        let index = match backend {
+            "hardware" => 0,
+            "warp" => 1,
+            other => panic!("unknown backend {other}"),
+        };
+        counts[index] += 1;
+    });
+    assert!(counts.iter().any(|&n| n == cases.len()));
+    assert!(counts.iter().all(|&n| n == 0 || n == cases.len()));
+    println!("VIC11 op={name} cases={} default={} warp={}", cases.len(), counts[0], counts[1]);
+}
+
+#[test]
+fn vic11_common_bcnt0_32() {
+    vic11_probe(0x0d, "bcnt0_32", |x| (x as u32).count_zeros(), true);
+}
+
+#[test]
+fn vic11_common_bcnt0_64() {
+    vic11_probe(0x0e, "bcnt0_64", u64::count_zeros, true);
+}
+
+#[test]
+fn vic11_common_ff0_32() {
+    vic11_probe(0x11, "ff0_32", |x| {
+        (0..32).find(|bit| x & (1 << bit) == 0).unwrap_or(u32::MAX)
+    }, false);
+}
+
+#[test]
+fn vic11_common_ff0_64() {
+    vic11_probe(0x12, "ff0_64", |x| {
+        (0..64).find(|bit| x & (1 << bit) == 0).unwrap_or(u32::MAX)
+    }, false);
+}
+
+#[test]
+fn vic11_flbit_unsigned() {
+    vic11_probe(0x16, "flbit_b64", |x| {
+        (0..64).find(|offset| x & (1 << (63 - offset)) != 0).unwrap_or(u32::MAX)
+    }, false);
+}
+
+#[test]
+fn vic11_flbit_signed() {
+    vic11_probe(0x18, "flbit_i64", |x| {
+        let sign = x >> 63;
+        (0..64).find(|offset| (x >> (63 - offset)) & 1 != sign).unwrap_or(u32::MAX)
+    }, false);
+}
