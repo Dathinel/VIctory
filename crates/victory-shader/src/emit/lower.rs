@@ -6660,6 +6660,47 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_phi_cycle() {
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8101, // loop header: s_cmp_eq_u32 s1, 1 (group Y)
+            0xBF85_0001, // skip the overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0 (group X)
+            0xBF85_FFFB, // take the backedge to the header
+            0xBF07_8006, // branch on s6 at loop exit
+            0xBF85_0001,
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let ir = ir::build(&code, false, 256).unwrap();
+        let phis: Vec<_> = ir.blocks.iter().flat_map(|b| &b.phis)
+            .filter(|p| p.reg == ir::Reg::S(6)).collect();
+        assert!(phis.iter().any(|p| phis.iter().any(|q| {
+            p.value != q.value && p.args.contains(&q.value) && q.args.contains(&p.value)
+        })), "expected two mutually dependent s6 phis");
+        let group_ids_xy = 3 << 7;
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[7..]].concat();
+        let live = refusal(&words);
+        let reference = refusal(&direct);
+        words[7] = 0xBF07_8000; // read group X; the timestamp is dead
+        lowers(&words, group_ids_xy).expect("dead timestamp across a loop");
+        words[7] = 0xBF07_8006;
+        words[0] = 0xBE86_0381; // s_mov_b32 s6, 1: representable input
+        words[1] = 0xBE87_0380; // s_mov_b32 s7, 0
+        lowers(&words, group_ids_xy).expect("supported input across the same loop");
+        eprintln!("two cyclic s6 phis: live={live:?}, direct={reference:?}, dead=ok, constant=ok");
+        assert_eq!(live, reference);
+    }
+
+    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
