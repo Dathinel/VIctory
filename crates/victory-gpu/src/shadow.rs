@@ -188,6 +188,8 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        #[cfg(test)]
+        n1_refresh_boundary::record(self, address, len);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -496,4 +498,90 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+// Append inside shadow.rs for the three local test builds.
+#[cfg(test)]
+mod n1_refresh_boundary {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+
+    thread_local! {
+        static COPY_BACK: RefCell<Vec<(usize, usize, usize)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(shadow: &Shadow, address: usize, len: usize) {
+        COPY_BACK.with_borrow_mut(|calls| calls.push((shadow as *const Shadow as usize, address, len)));
+    }
+
+    #[test]
+    fn measure_refresh_visibility_at_a_repeated_write() {
+        let host = host().expect("experiment requires an initialized D3D12 host");
+        for repeat in [false, true] {
+            let mut source = Box::new([0u8; 3]);
+            let start = source.as_mut_ptr() as usize;
+            let (buffer, mapped) = host.shared_buffer(3).expect("mapped test resource");
+            let shadow = Arc::new(Shadow::new(buffer, mapped, 0, start as u64, 3));
+            let (buffer, mapped) = host.shared_buffer(3).expect("second mapped test resource");
+            let other = Arc::new(Shadow::new(buffer, mapped, 0, start as u64, 3));
+            let first = host.new_list().expect("first list");
+            first.defer_refresh(&shadow, start, 3);
+            first.defer_refresh(&other, start, 3);
+            first.defer_gpu_write(&shadow, start, 1);
+            first.close();
+
+            let second = host.new_list().expect("second list");
+            second.defer_gpu_write(&other, start, 1);
+            second.defer(move || {
+                // The source allocation is live until the synchronous submission returns.
+                unsafe { (start as *mut u8).add(2).write(33) };
+            });
+            second.defer_refresh(&shadow, start + 2, 1);
+            let address = if repeat { start } else { start + 1 };
+            second.defer_gpu_write(&shadow, address, 1);
+            let visible = Arc::new(AtomicUsize::new(usize::MAX));
+            let count = Arc::new(AtomicUsize::new(usize::MAX));
+            let observed = Arc::clone(&visible);
+            let declarations = Arc::clone(&count);
+            let read = Arc::clone(&shadow);
+            let last = Arc::clone(&other);
+            second.defer_host(move || {
+                // This byte is outside both declared ranges and belongs to the mapped test resource.
+                let current = unsafe { read.data.add(2).read() };
+                observed.store(usize::from(current), Ordering::Relaxed);
+                declarations.store(read.pending.lock().unwrap().len(), Ordering::Relaxed);
+                // These mapped bytes belong to different three-byte resources. They
+                // copy back to the same source address in declaration order.
+                unsafe {
+                    read.data.write(11);
+                    last.data.write(22);
+                }
+            });
+            second.close();
+            COPY_BACK.with_borrow_mut(Vec::clear);
+            host.execute(&[&first, &second]);
+            let calls = COPY_BACK.with_borrow_mut(std::mem::take);
+            let mut expected = vec![
+                (Arc::as_ptr(&shadow) as usize, start, 1),
+                (Arc::as_ptr(&other) as usize, start, 1),
+            ];
+            if !repeat {
+                expected.push((Arc::as_ptr(&shadow) as usize, start + 1, 1));
+            }
+            assert_eq!(calls, expected, "one copy-back per exact range in first-declaration order");
+            let seen = visible.load(Ordering::Relaxed);
+            let pending = count.load(Ordering::Relaxed);
+            // GPU commands never touch the resource. The mapped allocation still belongs to shadow.
+            let final_byte = unsafe { shadow.data.add(2).read() };
+            assert!(matches!(seen, 0 | 33), "observation callback did not run");
+            assert!(matches!(pending, 1 | 2), "unexpected declaration count");
+            assert_eq!(final_byte, 33, "end-of-batch flush");
+            assert_eq!(*source, [22, 0, 33], "the second shadow writes back last");
+            if !repeat {
+                assert_eq!((seen, pending), (33, 2), "distinct-range control");
+            }
+            println!("repeat={repeat} before_submit={seen} pending={pending} after_submit={final_byte} copy_backs={} last_writer={}", calls.len(), source[0]);
+        }
+    }
 }
