@@ -10190,6 +10190,9 @@ mod select_tests {
                 .unwrap();
             let ps = emit(&pc, &ps_native, &pp, &pst, &pio, &pres).unwrap();
 
+            #[cfg(not(windows))]
+            let _ = (&ms, &ps);
+
             #[cfg(windows)]
             {
                 if let Ok(mut v) = crate::emit::validator::Validator::load(None) {
