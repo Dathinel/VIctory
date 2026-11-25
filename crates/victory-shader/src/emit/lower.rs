@@ -372,6 +372,15 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// Granlund-Montgomery unsigned reciprocal `(magic, shift)` for dividing any
+/// `x < 2^30` by odd `odd >= 3`: `((x * magic) >> (32 + shift)) == x / odd`.
+fn structured_div_magic(odd: u32) -> (u32, u32) {
+    debug_assert!(odd >= 3 && odd % 2 == 1 && odd < (1 << 30));
+    let shift = 31 - odd.leading_zeros();
+    let magic = (1u64 << (32 + shift)).div_ceil(u64::from(odd));
+    (magic as u32, shift)
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Samples whose level comes from derivatives across each quad of lanes.
@@ -4091,6 +4100,68 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Splits byte offset `addr` into `(element_index, element_offset)` for a
+    /// structured SRV whose `stride` is a multiple of 4 (`stride >= 4`).
+    ///
+    /// Uses shifts/masks for power-of-two strides and 32-bit half-product
+    /// reciprocal multiplication for non-power-of-two strides instead of
+    /// `udiv`/`urem`: NVIDIA's DXIL compiler (`nvgpucomp64.dll`) hits a null
+    /// dereference (`E_OUTOFMEMORY`) inside `CreatePipelineState` on graphics
+    /// stages (`ms`/`vs`/`ps`) when a `waveReadLane*`-derived uniform offset
+    /// passes through `udiv(addr, stride)` (or `dx.op.binaryWithTwoOutputs`
+    /// `UMul`) into `rawBufferLoad` on a `StructuredBuffer` with that stride.
+    /// Because `stride` is a multiple of 4, `addr >> tz < 2^30`, so the
+    /// Granlund-Montgomery multiplier fits in `u32` with no carry step and is
+    /// exact for every `u32` without requiring `INT64` or `WAVE_OPS`.
+    fn structured_index_and_offset(&mut self, addr: V, stride: u32) -> (V, V) {
+        debug_assert!(stride >= 4 && stride.is_multiple_of(4));
+        if let Some(byte) = self.s.m.int_value(addr) {
+            let byte = byte as u32;
+            return (self.s.m.i32(byte / stride), self.s.m.i32(byte % stride));
+        }
+        let c = self.cur;
+        let tz = stride.trailing_zeros();
+        let odd = stride >> tz;
+        if odd == 1 {
+            let sh = self.s.m.i32(tz);
+            let mask = self.s.m.i32(stride - 1);
+            return (
+                self.s.m.bin(c, Bin::LShr, addr, sh),
+                self.s.m.bin(c, Bin::And, addr, mask),
+            );
+        }
+        let (magic, shift) = structured_div_magic(odd);
+        let tz_v = self.s.m.i32(tz);
+        let shifted = self.s.m.bin(c, Bin::LShr, addr, tz_v);
+        let k16 = self.s.m.i32(16);
+        let mask16 = self.s.m.i32(0xffff);
+        let a_lo = self.s.m.bin(c, Bin::And, shifted, mask16);
+        let a_hi = self.s.m.bin(c, Bin::LShr, shifted, k16);
+        let m_lo = self.s.m.i32(magic & 0xffff);
+        let m_hi = self.s.m.i32(magic >> 16);
+        let p0 = self.s.m.bin(c, Bin::Mul, a_lo, m_lo);
+        let p1 = self.s.m.bin(c, Bin::Mul, a_lo, m_hi);
+        let p2 = self.s.m.bin(c, Bin::Mul, a_hi, m_lo);
+        let p3 = self.s.m.bin(c, Bin::Mul, a_hi, m_hi);
+        let p0_hi = self.s.m.bin(c, Bin::LShr, p0, k16);
+        let p1_lo = self.s.m.bin(c, Bin::And, p1, mask16);
+        let p2_lo = self.s.m.bin(c, Bin::And, p2, mask16);
+        let mid = self.s.m.bin(c, Bin::Add, p0_hi, p1_lo);
+        let mid = self.s.m.bin(c, Bin::Add, mid, p2_lo);
+        let mid_hi = self.s.m.bin(c, Bin::LShr, mid, k16);
+        let p1_hi = self.s.m.bin(c, Bin::LShr, p1, k16);
+        let p2_hi = self.s.m.bin(c, Bin::LShr, p2, k16);
+        let hi = self.s.m.bin(c, Bin::Add, p3, p1_hi);
+        let hi = self.s.m.bin(c, Bin::Add, hi, p2_hi);
+        let hi = self.s.m.bin(c, Bin::Add, hi, mid_hi);
+        let shift_v = self.s.m.i32(shift);
+        let index = self.s.m.bin(c, Bin::LShr, hi, shift_v);
+        let stride_v = self.s.m.i32(stride);
+        let elem_base = self.s.m.bin(c, Bin::Mul, index, stride_v);
+        let elem_off = self.s.m.bin(c, Bin::Sub, addr, elem_base);
+        (index, elem_off)
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -4616,16 +4687,7 @@ impl<'a> Lower<'a> {
     }
 
     fn structured_coords(&mut self, addr: V, stride: u32) -> (V, V) {
-        if let Some(addr) = self.s.m.int_value(addr) {
-            let addr = addr as u32;
-            return (self.s.m.i32(addr / stride), self.s.m.i32(addr % stride));
-        }
-        let stride = self.s.m.i32(stride);
-        let c = self.cur;
-        (
-            self.s.m.bin(c, Bin::UDiv, addr, stride),
-            self.s.m.bin(c, Bin::URem, addr, stride),
-        )
+        self.structured_index_and_offset(addr, stride)
     }
 
     fn buffer_dword(&mut self, h: V, index: V, off: V) -> V {
@@ -10150,158 +10212,8 @@ fn wave_lane(m: &mut Module, block: usize, lane: V, wave64: bool) -> V {
 mod tests;
 
 #[cfg(test)]
-mod select_tests {
-    use super::super::emit;
-    use crate::native::{ComputeIo, RootParam};
-    use crate::{Container, FourCC, HwStage, NativeProgram, ResourceType, RootType, UsedResource};
-
-    #[test]
-    fn selects_from_independently_written_mask_words() {
-        let words = [
-            0xbe81_0380u32, // s1 = 0 (table address high)
-            0xf408_0200,
-            0xfa00_0000, // load UAV into s[8:11]
-            0xbe84_03ff,
-            0x8000_0000, // s4 = lane 31
-            0xbe85_0381, // s5 = lane 32 in wave64
-            0x7e02_028b,
-            0x7e04_029d, // v1 = 11, v2 = 29
-            0xd501_0003,
-            0x0012_0501, // v_cndmask_b32 v3, v1, v2, s[4:5]
-            0x3402_0082, // v1 = 4 * v0
-            0xe070_1000,
-            0x8002_0301, // store v3 to UAV at v1
-            0xbf81_0000,
-        ];
-        let container = crate::dxbc::build(&[]);
-        let c = Container::parse(&container).unwrap();
-        for (wave64, uses_select) in [(false, true), (true, true), (true, false)] {
-            let mut words = words;
-            if !uses_select {
-                words[12] = 0x8002_0101; // store v1 instead of the select result
-            }
-            let native = NativeProgram {
-                stage: HwStage::Cs,
-                wave64,
-                vgprs: 4,
-                layout: vec![RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: 0,
-                    slot: 0,
-                }],
-                used: vec![UsedResource {
-                    kind: ResourceType::Uav,
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: 0,
-                    slot: 0,
-                }],
-                io: crate::native::StageIo::Cs(ComputeIo {
-                    rsrc2: 2,
-                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
-                }),
-                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-            };
-            let p = crate::ir::build(&native.code, wave64, native.vgprs).unwrap();
-            let st = crate::structure::structure(&p).unwrap();
-            let io = crate::io::raise(&p, &native).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
-            let emitted = Container::parse(&shader.dxil).unwrap();
-            let features = emitted.part(FourCC::SFI0).unwrap();
-            let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
-            assert_eq!(wave_ops, uses_select);
-        }
-    }
-
-    #[test]
-    fn scalar_buffer_load_from_structured_srv_uses_structured_resource() {
-        // Load a structured SRV descriptor (stride 24) from table s0 into s[4:7],
-        // read two dwords at byte offset 8 with s_buffer_load_dwordx2, and store
-        // the second dword to a raw UAV at table offset 4 dwords.
-        let words = [
-            0xbe81_0380u32, // s1 = 0 (table address high)
-            0xf408_0100,
-            0xfa00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0x0 (structured SRV)
-            0xf408_0200,
-            0xfa00_0010, // s_load_dwordx4 s[8:11], s[0:1], 0x10 (raw UAV)
-            0xf424_0302,
-            0xfa00_0008, // s_buffer_load_dwordx2 s[12:13], s[4:7], 0x8
-            0x7e02_020d, // v1 = s13
-            0x3404_0082, // v2 = 4 * v0
-            0xe070_1000,
-            0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
-            0xbf81_0000, // s_endpgm
-        ];
-        // The shader for an SRV of `stride` bytes per element.
-        let lowered = |stride: u32| {
-            let native = NativeProgram {
-                stage: HwStage::Cs,
-                wave64: false,
-                vgprs: 4,
-                layout: vec![RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: 0,
-                    slot: 0,
-                }],
-                used: vec![
-                    UsedResource {
-                        kind: ResourceType::Srv,
-                        root: RootType::Table,
-                        table_offset_dwords: 0,
-                        lower_bound: 0,
-                        stride,
-                        dwords: 4,
-                        user_data: 0,
-                        slot: 0,
-                    },
-                    UsedResource {
-                        kind: ResourceType::Uav,
-                        root: RootType::Table,
-                        table_offset_dwords: 4,
-                        lower_bound: 0,
-                        stride: 0,
-                        dwords: 4,
-                        user_data: 0,
-                        slot: 0,
-                    },
-                ],
-                io: crate::native::StageIo::Cs(ComputeIo {
-                    rsrc2: 2,
-                    threads: [32, 1, 1],
-                }),
-                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-            };
-            let container = crate::dxbc::build(&[]);
-            let c = Container::parse(&container).unwrap();
-            let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
-            let st = crate::structure::structure(&p).unwrap();
-            let io = crate::io::raise(&p, &native).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-            emit(&c, &native, &p, &st, &io, &res).unwrap()
-        };
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut shader = lowered(24);
-        assert!(!shader.dxil.is_empty());
-        // The stride is what makes the load a structured one: the same
-        // program over an SRV without one (a raw buffer) lowers differently.
-        assert_ne!(shader.dxil, lowered(0).dxil);
-        #[cfg(windows)]
-        if let Ok(mut v) = crate::emit::validator::Validator::load(None) {
-            v.validate(&mut shader.dxil)
-                .expect("structured scalar SRV load DXIL must validate");
-        }
-    }
-}
+#[path = "select_tests.rs"]
+mod select_tests;
 
 #[cfg(test)]
 mod wave_size_tests {
