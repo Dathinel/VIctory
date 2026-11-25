@@ -1999,6 +1999,88 @@ fn bcpack_zigzag_decode_matches_the_formats_function() {
     });
 }
 
+/// `victory_formats::bcpack::quads`, the function the test below runs as console code.
+fn quads_reference(rank: &[u8; 256], s: &[u8], ix: &mut [u8]) {
+    for (q, &sym) in s.iter().enumerate() {
+        let v = rank[usize::from(sym)];
+        let base = (q >> 1) * 8 + (q & 1) * 2;
+        for (k, p) in [0, 1, 4, 5].into_iter().enumerate() {
+            ix[base + p] = v >> (2 * k) & 3;
+        }
+    }
+}
+
+/// BCPack's 2-bit index residuals, one symbol per 2x2 quad, written as console code, match
+/// the formats crate's function on the GPU: each quad's four residuals and where the quad
+/// starts in the block row, for a rank table and a symbol order that are both permutations.
+#[test]
+fn bcpack_quad_residuals_match_the_formats_function() {
+    let rank: [u8; 256] = std::array::from_fn(|i| (i * 167 + 13) as u8);
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the symbol, v2 = the quad's number; v3 = the symbol's dword in the table, v5 =
+    // that dword.
+    body.extend(vop3(0x148, 1, vgpr(1), 128, 128 + 8)); // v_bfe_u32 v1, v1, 0, 8
+    body.extend(vop3(0x116, 3, 128 + 2, vgpr(1), 128)); // v_lshrrev_b32 v3, 2, v1
+    for (d, row) in rank.as_chunks::<4>().0.iter().enumerate() {
+        let reg = if d == 0 { 5 } else { 6 };
+        body.extend([vop1(0x001, reg, 255), u32::from_le_bytes(*row)]); // v_mov_b32 reg, row
+        if d != 0 {
+            body.extend(vop3(0x0C2, 106, 128 + d as u16, vgpr(3), 128)); // v_cmp_eq_u32 vcc, d, v3
+            body.extend(vop3(0x101, 5, vgpr(5), vgpr(6), vcc)); // v_cndmask_b32 v5, v5, v6, vcc
+        }
+    }
+    // The entry's byte, then its four residuals, one to a nibble of the result.
+    body.extend(vop3(0x148, 7, vgpr(1), 128, 128 + 2)); // v_bfe_u32 v7, v1, 0, 2
+    body.extend(vop3(0x11A, 7, 128 + 3, vgpr(7), 128)); // v_lshlrev_b32 v7, 3, v7
+    body.extend(vop3(0x116, 8, vgpr(7), vgpr(5), 128)); // v_lshrrev_b32 v8, v7, v5
+    body.extend(vop3(0x148, 0, vgpr(8), 128, 128 + 2)); // v_bfe_u32 v0, v8, 0, 2
+    for k in 1u16..4 {
+        body.extend(vop3(0x148, 9, vgpr(8), 128 + 2 * k, 128 + 2)); // v_bfe_u32 v9, v8, 2k, 2
+        body.extend(vop3(0x36F, 0, vgpr(9), 128 + 4 * k, vgpr(0))); // v_lshl_or_b32 v0, v9, 4k, v0
+    }
+    // Where the quad starts: eight pixels per pair of quads, two for the odd one. It goes
+    // in the result's high half.
+    body.extend(vop3(0x116, 10, 129, vgpr(2), 128)); // v_lshrrev_b32 v10, 1, v2
+    body.extend(vop3(0x148, 11, vgpr(2), 128, 129)); // v_bfe_u32 v11, v2, 0, 1
+    body.extend(vop3(0x11A, 11, 129, vgpr(11), 128)); // v_lshlrev_b32 v11, 1, v11
+    body.extend(vop3(0x36F, 10, vgpr(10), 128 + 3, vgpr(11))); // v_lshl_or_b32 v10, v10, 3, v11
+    body.extend(vop3(0x36F, 0, vgpr(10), 128 + 16, vgpr(0))); // v_lshl_or_b32 v0, v10, 16, v0
+    let shader = build_valu_cs(&body);
+    let symbols: Vec<u8> = (0..256).map(|k| (k * 91 + 7) as u8).collect();
+    let mut ix = vec![0xFFu8; 4 * symbols.len()];
+    quads_reference(&rank, &symbols, &mut ix);
+    let cases: Vec<[u32; 4]> = symbols
+        .iter()
+        .enumerate()
+        .map(|(q, &s)| [u32::from(s), q as u32, 0, 0])
+        .collect();
+    // Each backend must read every cell the function wrote, each once.
+    let mut read = std::collections::BTreeMap::new();
+    run_cases(&shader, &cases, |backend, q, _, got| {
+        let base = (got >> 16) as usize;
+        let seen: &mut Vec<bool> = read
+            .entry(backend.to_string())
+            .or_insert(vec![false; ix.len()]);
+        for (k, p) in [0, 1, 4, 5].into_iter().enumerate() {
+            let cell = base + p;
+            assert!(
+                cell < ix.len() && !seen[cell],
+                "{backend}: quad {q} lands on cell {cell}"
+            );
+            seen[cell] = true;
+            assert_eq!(
+                got >> (4 * k) & 15,
+                u32::from(ix[cell]),
+                "{backend}: quad {q}, pixel {k}"
+            );
+        }
+    });
+    for (backend, seen) in read {
+        assert!(seen.iter().all(|&s| s), "{backend}: cells never read");
+    }
+}
+
 /// `victory_formats::bcpack::pairs`, the function the test below runs as console code.
 fn pairs_reference(rank: &[u8; 64], s: &[u8], ix: &mut [u8]) {
     for (k, &sym) in s.iter().enumerate() {
