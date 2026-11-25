@@ -322,6 +322,8 @@ struct Lower<'a> {
     exported: Vec<bool>,
     /// Per IR block: a `vm` export is behind every lane entering it.
     vm_exported: Vec<bool>,
+    /// Whether a Valid-Mask export lies on some path into each block.
+    vm_reached: Vec<bool>,
     /// Per-lane Valid Mask SSA value while lowering a pixel block.
     vm_live: Option<V>,
     /// Phi of `vm_live` at the start of multi-predecessor pixel blocks.
@@ -854,6 +856,7 @@ impl<'a> Lower<'a> {
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             vm_exported: vec![false; p.blocks.len()],
+            vm_reached: vec![false; p.blocks.len()],
             vm_live: None,
             vm_live_phis: vec![None; p.blocks.len()],
             vm_live_out: vec![None; p.blocks.len()],
@@ -1364,6 +1367,9 @@ impl<'a> Lower<'a> {
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
             self.vm_exported[b] =
                 !preds.is_empty() && preds.iter().all(|&q| self.vm_exported_out(q));
+            self.vm_reached[b] = preds
+                .iter()
+                .any(|&q| self.vm_reached[q] || self.has_vm_export(q));
             if self.s.pixel {
                 self.vm_live = Some(if preds.is_empty() {
                     // Alive until the first Valid-Mask export.
@@ -3357,7 +3363,25 @@ impl<'a> Lower<'a> {
                 self.read_lane(x, src)
             };
             // Inactive source lanes return 0, not the stale VGPR.
-            let r = self.active_lane_or_zero(r, src);
+            // (Mesh: the ballot is of the host wave, so ask for the source's
+            // host lane, which a quad shares with this lane's quad.)
+            let probe = if mesh_quad {
+                let host = self.s.op(
+                    c,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    self.s.t.i32,
+                    111,
+                    &[],
+                );
+                let (not3, three) = (k(self, !3), k(self, 3));
+                let base = self.s.m.bin(c, Bin::And, host, not3);
+                let low = self.s.m.bin(c, Bin::And, src, three);
+                self.s.m.bin(c, Bin::Or, base, low)
+            } else {
+                src
+            };
+            let r = self.active_lane_or_zero(r, probe);
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -10290,6 +10314,22 @@ impl<'a> Lower<'a> {
                         let t = self.s.m.bool(true);
                         self.s
                             .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                    } else if self.vm_reached[b] {
+                        // A Valid-Mask export lies on some paths in only
+                        // (the others bypass it): the phi of `vm_live`
+                        // is still each lane's last guard, true where no
+                        // such export ran.
+                        let live = self.vm_live.expect("pixel vm_live");
+                        let t = self.s.m.bool(true);
+                        let kill = self.s.m.bin(self.cur, Bin::Xor, live, t);
+                        self.s.op(
+                            self.cur,
+                            "discard",
+                            Attr::NoUnwind,
+                            self.s.t.void,
+                            82,
+                            &[kill],
+                        );
                     }
                 }
                 Term::Ret
