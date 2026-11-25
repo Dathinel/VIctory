@@ -2480,3 +2480,30 @@ fn v_cndmask_on_an_inline_mask_picks_one_side() {
         );
     }
 }
+
+/// `victory_formats::xma::log2`, the function the test below runs as console code.
+fn xma_log2_reference(v: usize) -> u32 {
+    usize::BITS - 1 - v.max(1).leading_zeros()
+}
+
+/// XMA's integer base-2 logarithm, written as console code, matches the formats crate's
+/// function on the GPU: zero, every power of two and both of its neighbours.
+#[test]
+fn xma_integer_log2_matches_the_formats_function() {
+    let mut body = Vec::new();
+    // v1 = the value; zero counts as one.
+    body.extend(vop3(0x114, 5, vgpr(1), 129, 128)); // v_max_u32 v5, v1, 1
+    body.push(vop1(0x039, 6, vgpr(5))); // v_ffbh_u32 v6, v5
+    body.extend(vop3(0x126, 0, 128 + 31, vgpr(6), 128)); // v_sub_nc_u32 v0, 31, v6
+    let shader = build_valu_cs(&body);
+    let mut values = vec![0u32, u32::MAX];
+    for bit in 0..32 {
+        let p = 1u32 << bit;
+        values.extend([p.wrapping_sub(1), p, p.wrapping_add(1)]);
+    }
+    let cases: Vec<[u32; 4]> = values.into_iter().map(|v| [v, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = xma_log2_reference(inputs[0] as usize);
+        assert_eq!(got, want, "{backend}: log2({:#x})", inputs[0]);
+    });
+}
