@@ -8483,7 +8483,7 @@ impl<'a> Lower<'a> {
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
-let selector = (!uav && used.is_none())
+            let selector = (!uav && used.is_none())
                 .then(|| self.buffer_selector(src))
                 .flatten();
             match (index, selector) {

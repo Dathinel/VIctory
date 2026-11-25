@@ -1299,8 +1299,9 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
-/// The stride of a matching structured buffer view. The shader declaration
-/// and its descriptor must agree on both the access class and element size.
+/// The stride of a matching structured or raw buffer view. Structured
+/// views report their element size; a raw view reports 0 so the shader
+/// translator can treat an indexed access as a flat byte buffer (#462).
 pub(crate) fn structured_stride(view: &View, uav: bool) -> Option<u32> {
     let words = match (view, uav) {
         (View::Shader(_, Some(words)), false) | (View::Unordered(_, _, Some(words)), true) => words,
@@ -1316,6 +1317,9 @@ pub(crate) fn structured_stride(view: &View, uav: bool) -> Option<u32> {
         }
         // SAFETY: The view dimension selects the buffer member.
         let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            return Some(0);
+        }
         (buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE).then_some(buffer.StructureByteStride)?
     } else {
         let desc = srv_desc(words);
@@ -1324,6 +1328,9 @@ pub(crate) fn structured_stride(view: &View, uav: bool) -> Option<u32> {
         }
         // SAFETY: The view dimension selects the buffer member.
         let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
+            return Some(0);
+        }
         (buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE).then_some(buffer.StructureByteStride)?
     };
     ((4..=2048).contains(&stride) && stride.is_multiple_of(4)).then_some(stride)
@@ -3482,7 +3489,10 @@ mod structured_alias_tests {
             None
         );
         srv[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
-        assert_eq!(structured_stride(&View::Shader(0, Some(srv)), false), None);
+        assert_eq!(
+            structured_stride(&View::Shader(0, Some(srv)), false),
+            Some(0)
+        );
     }
 
     fn placed_raw_srv_handle(
