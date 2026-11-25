@@ -45,6 +45,9 @@ pub(crate) struct Lowered {
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    /// Whether the program ballots active lanes (`waveActiveBallot`).
+    #[cfg(test)]
+    pub has_wave_active_ballot: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1209,6 +1212,8 @@ impl<'a> Lower<'a> {
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
+        #[cfg(test)]
+        let has_wave_active_ballot = self.s.m.has_dx_op("dx.op.waveActiveBallot", 116);
         Ok(Lowered {
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
@@ -1237,6 +1242,8 @@ impl<'a> Lower<'a> {
             has_fcmp_uno,
             #[cfg(test)]
             has_coverage_op,
+            #[cfg(test)]
+            has_wave_active_ballot,
         })
     }
 
@@ -2618,6 +2625,44 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// `value` when console lane `lane` is in EXEC, else 0. Cross-lane reads
+    /// such as `ds_swizzle_b32` return 0 from an inactive source lane rather
+    /// than the stale VGPR `waveReadLaneAt` would see.
+    fn active_lane_or_zero(&mut self, value: V, lane: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let yes = self.s.m.bool(true);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        self.s.flags |= flags::WAVE_OPS;
+        let (k5, k31, one, z) = (
+            self.s.m.i32(5),
+            self.s.m.i32(31),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let words = match self.s.wave_size {
+            Some(32) => 1,
+            Some(64) => 2,
+            _ => 4,
+        };
+        let word_idx = self.s.m.bin(c, Bin::LShr, lane, k5);
+        let mut word = self.s.m.extract(c, ballot, 0);
+        for j in 1..words {
+            let kj = self.s.m.i32(j);
+            let wj = self.s.m.extract(c, ballot, j);
+            let is = self.s.m.cmp(c, pred::EQ, word_idx, kj);
+            word = self.s.m.select(c, is, wj, word);
+        }
+        let sh = self.s.m.bin(c, Bin::And, lane, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        let on = self.s.m.cmp(c, pred::NE, bit, z);
+        self.s.m.select(c, on, value, z)
+    }
+
     /// Coarse derivatives of `coords` across this lane's quad, as DXIL
     /// gradients (x for up to three coordinates, then y), each times
     /// `scale` if given.
@@ -2737,6 +2782,8 @@ impl<'a> Lower<'a> {
             } else {
                 self.read_lane(x, src)
             };
+            // Inactive source lanes return 0, not the stale VGPR.
+            let r = self.active_lane_or_zero(r, src);
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -9188,6 +9235,27 @@ mod tests {
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         lower_words(words, rsrc2).map(|_| ())
+    }
+
+    /// `ds_swizzle_b32` must ballot-mask inactive source lanes to 0 (VIC-BT-018):
+    /// a plain `waveReadLaneAt` would otherwise return a stale VGPR.
+    #[test]
+    fn ds_swizzle_b32_zeros_inactive_source_lanes() {
+        // s_mov_b32 exec_lo, 0x5555 (odd lanes inactive); ds_swizzle_b32 v1, v0
+        // offset:0x41f (and:0x1f or:0 xor:1 — exchange with the neighbour).
+        let words = [
+            0xBEFE_03FF,
+            0x0000_5555,
+            0xD8D4_041F,
+            0x0100_0000,
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(&words, 0).expect("ds_swizzle_b32 lowers");
+        assert!(
+            lowered.has_wave_active_ballot,
+            "ds_swizzle_b32 must ballot-mask inactive source lanes to 0"
+        );
+        assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
     }
 
     #[test]
