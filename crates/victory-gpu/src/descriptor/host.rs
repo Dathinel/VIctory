@@ -1499,26 +1499,34 @@ pub(crate) fn structured_stride(view: &View, uav: bool) -> Option<u32> {
     };
     let stride = if uav {
         let desc = uav_desc(words);
-        if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+        if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
             return None;
         }
         // SAFETY: The view dimension selects the buffer member.
         let buffer = unsafe { desc.Anonymous.Buffer };
-        if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-            return Some(0);
+        match (desc.Format, buffer.Flags, buffer.StructureByteStride) {
+            (DXGI_FORMAT_UNKNOWN, D3D12_BUFFER_UAV_FLAG_RAW, _)
+            | (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_UAV_FLAG_RAW, 0) => {
+                return Some(0);
+            }
+            (DXGI_FORMAT_UNKNOWN, D3D12_BUFFER_UAV_FLAG_NONE, stride) => stride,
+            _ => return None,
         }
-        (buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE).then_some(buffer.StructureByteStride)?
     } else {
         let desc = srv_desc(words);
-        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
             return None;
         }
         // SAFETY: The view dimension selects the buffer member.
         let buffer = unsafe { desc.Anonymous.Buffer };
-        if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
-            return Some(0);
+        match (desc.Format, buffer.Flags, buffer.StructureByteStride) {
+            (DXGI_FORMAT_UNKNOWN, D3D12_BUFFER_SRV_FLAG_RAW, _)
+            | (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_SRV_FLAG_RAW, 0) => {
+                return Some(0);
+            }
+            (DXGI_FORMAT_UNKNOWN, D3D12_BUFFER_SRV_FLAG_NONE, stride) => stride,
+            _ => return None,
         }
-        (buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE).then_some(buffer.StructureByteStride)?
     };
     ((4..=2048).contains(&stride) && stride.is_multiple_of(4)).then_some(stride)
 }
@@ -3902,6 +3910,73 @@ mod structured_alias_tests {
         assert_eq!(
             structured_stride(&View::Shader(0, Some(srv)), false),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn structured_stride_recognizes_a_typeless_raw_srv() {
+        let mut words = [0; 10];
+        words[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        words[6] = 16; // NumElements
+        words[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        assert_eq!(
+            structured_stride(&View::Shader(0, Some(words)), false),
+            Some(0)
+        );
+
+        words[7] = 16; // StructureByteStride
+        assert_eq!(
+            structured_stride(&View::Shader(0, Some(words)), false),
+            None
+        );
+        words[7] = 0;
+
+        words[0] = DXGI_FORMAT_R32_UINT.0 as u32;
+        assert_eq!(
+            structured_stride(&View::Shader(0, Some(words)), false),
+            None
+        );
+
+        words[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        words[8] = D3D12_BUFFER_SRV_FLAG_NONE.0 as u32;
+        assert_eq!(
+            structured_stride(&View::Shader(0, Some(words)), false),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_stride_recognizes_a_typeless_raw_uav() {
+        let mut words = [0; 10];
+        words[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        words[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+        words[4] = 16; // NumElements
+        words[8] = D3D12_BUFFER_UAV_FLAG_RAW.0 as u32;
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(words)), true),
+            Some(0)
+        );
+
+        words[5] = 16; // StructureByteStride
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(words)), true),
+            None
+        );
+        words[5] = 0;
+
+        words[0] = DXGI_FORMAT_R32_UINT.0 as u32;
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(words)), true),
+            None
+        );
+
+        words[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        words[8] = D3D12_BUFFER_UAV_FLAG_NONE.0 as u32;
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(words)), true),
+            None
         );
     }
 
