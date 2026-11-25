@@ -2044,6 +2044,36 @@ fn bcpack_zigzag_decode_matches_the_formats_function() {
     });
 }
 
+/// `victory_formats::bcpack::interleave`, the function the test below runs as console code.
+fn interleave_reference(a: u8, b: u8) -> u8 {
+    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
+    spread(a) | spread(b) << 1
+}
+
+/// BCPack's interleave of two 4-bit symbols, written as console code, matches the formats
+/// crate's function on the GPU: every pair of symbols, with and without bits above the
+/// nibble that the function ignores.
+#[test]
+fn bcpack_symbol_interleave_matches_the_formats_function() {
+    // v1 = the first symbol, on the even bits; v2 = the second, on the odd ones.
+    let mut body = vec![vop1(0x001, 0, 128)]; // v_mov_b32 v0, 0
+    for bit in 0u16..4 {
+        for (symbol, position) in [(1, 2 * bit), (2, 2 * bit + 1)] {
+            body.extend(vop3(0x148, 3, vgpr(symbol), 128 + bit, 129)); // v_bfe_u32 v3, symbol, bit, 1
+            body.extend(vop3(0x36F, 0, vgpr(3), 128 + position, vgpr(0))); // v_lshl_or_b32 v0, v3, position, v0
+        }
+    }
+    let shader = build_valu_cs(&body);
+    let mut cases: Vec<[u32; 4]> = (0u32..256)
+        .map(|pair| [pair & 15, pair >> 4, 0, 0])
+        .collect();
+    cases.extend((0u32..16).map(|a| [a | 0xF0, (15 - a) | 0xA0, 0, 0]));
+    run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+        let want = u32::from(interleave_reference(a as u8, b as u8));
+        assert_eq!(got, want, "{backend}: interleave({a:#x}, {b:#x})");
+    });
+}
+
 /// `victory_formats::bcpack::add_index`, the function the test below runs as console code.
 fn add_index_reference(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
     let up = |v: i16, b: u8| {
@@ -2508,32 +2538,73 @@ fn xma_integer_log2_matches_the_formats_function() {
     });
 }
 
-/// `victory_formats::bcpack::interleave`, the function the test below runs as console code.
-fn interleave_reference(a: u8, b: u8) -> u8 {
-    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
-    spread(a) | spread(b) << 1
+/// `victory_formats::xma::to_i16`, the function the test below runs as console code.
+fn xma_to_i16_reference(v: f32) -> i16 {
+    (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }
 
-/// BCPack's interleave of two 4-bit symbols, written as console code, matches the formats
-/// crate's function on the GPU: every pair of symbols, with and without bits above the
-/// nibble that the function ignores.
+/// XMA's sample conversion from float to 16 bits, written as console code, matches the
+/// formats crate's function on the GPU: ties round away from zero, both ends saturate.
 #[test]
-fn bcpack_symbol_interleave_matches_the_formats_function() {
-    // v1 = the first symbol, on the even bits; v2 = the second, on the odd ones.
-    let mut body = vec![vop1(0x001, 0, 128)]; // v_mov_b32 v0, 0
-    for bit in 0u16..4 {
-        for (symbol, position) in [(1, 2 * bit), (2, 2 * bit + 1)] {
-            body.extend(vop3(0x148, 3, vgpr(symbol), 128 + bit, 129)); // v_bfe_u32 v3, symbol, bit, 1
-            body.extend(vop3(0x36F, 0, vgpr(3), 128 + position, vgpr(0))); // v_lshl_or_b32 v0, v3, position, v0
+fn xma_sample_to_i16_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the sample. v5 = it scaled, v6 = that truncated, v7 = the fraction cut off.
+    body.extend([vop1(0x001, 5, 255), 32768f32.to_bits()]); // v_mov_b32 v5, 32768.0
+    body.extend(vop3(0x108, 5, vgpr(1), vgpr(5), 128)); // v_mul_f32 v5, v1, v5
+    body.push(vop1(0x021, 6, vgpr(5))); // v_trunc_f32 v6, v5
+    body.extend(vop3(0x104, 7, vgpr(5), vgpr(6), 128)); // v_sub_f32 v7, v5, v6
+    // A fraction of a half or more moves one further from zero.
+    body.extend(vop3(0x103, 8, vgpr(6), 242, 128)); // v_add_f32 v8, v6, 1.0
+    body.extend(vop3(0x006, 106, vgpr(7), 240, 128)); // v_cmp_ge_f32 vcc, v7, 0.5
+    body.extend(vop3(0x101, 9, vgpr(6), vgpr(8), vcc)); // v_cndmask_b32 v9, v6, v8, vcc
+    body.extend(vop3(0x103, 8, vgpr(6), 243, 128)); // v_add_f32 v8, v6, -1.0
+    body.extend(vop3(0x003, 106, vgpr(7), 241, 128)); // v_cmp_le_f32 vcc, v7, -0.5
+    body.extend(vop3(0x101, 9, vgpr(9), vgpr(8), vcc)); // v_cndmask_b32 v9, v9, v8, vcc
+    // Saturate, then convert.
+    body.extend([vop1(0x001, 10, 255), (-32768f32).to_bits()]); // v_mov_b32 v10, -32768.0
+    body.extend(vop3(0x110, 9, vgpr(9), vgpr(10), 128)); // v_max_f32 v9, v9, v10
+    body.extend([vop1(0x001, 10, 255), 32767f32.to_bits()]); // v_mov_b32 v10, 32767.0
+    body.extend(vop3(0x10F, 9, vgpr(9), vgpr(10), 128)); // v_min_f32 v9, v9, v10
+    body.push(vop1(0x008, 0, vgpr(9))); // v_cvt_i32_f32 v0, v9
+    // Not a number converts to zero: `v_max_f32` alone would have saturated it.
+    body.extend(vop3(0x008, 106, vgpr(1), vgpr(1), 128)); // v_cmp_u_f32 vcc, v1, v1
+    body.extend(vop3(0x101, 0, vgpr(0), 128, vcc)); // v_cndmask_b32 v0, v0, 0, vcc
+    let shader = build_valu_cs(&body);
+    let step = 1.0 / 32768.0;
+    let mut samples = vec![
+        0.0f32,
+        -0.0,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    // Ties and their neighbours on both sides of zero, and just inside each end.
+    for k in [0.5f32, 1.5, 2.5, 3.5, 32766.5, 32767.5] {
+        for x in [
+            k,
+            f32::from_bits(k.to_bits() - 1),
+            f32::from_bits(k.to_bits() + 1),
+        ] {
+            samples.extend([x * step, -x * step]);
         }
     }
-    let shader = build_valu_cs(&body);
-    let mut cases: Vec<[u32; 4]> = (0u32..256)
-        .map(|pair| [pair & 15, pair >> 4, 0, 0])
-        .collect();
-    cases.extend((0u32..16).map(|a| [a | 0xF0, (15 - a) | 0xA0, 0, 0]));
-    run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
-        let want = u32::from(interleave_reference(a as u8, b as u8));
-        assert_eq!(got, want, "{backend}: interleave({a:#x}, {b:#x})");
+    samples.extend((0..64).map(|i| (i as f32 * 0.618_034).sin() * 1.1));
+    let cases: Vec<[u32; 4]> = samples.iter().map(|s| [s.to_bits(), 0, 0, 0]).collect();
+    let mut wrong = Vec::new();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let v = f32::from_bits(inputs[0]);
+        let want = xma_to_i16_reference(v) as i32 as u32;
+        if got != want {
+            wrong.push(format!(
+                "{backend}: to_i16({v:e}) = {} want {}",
+                got as i32, want as i32
+            ));
+        }
     });
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
