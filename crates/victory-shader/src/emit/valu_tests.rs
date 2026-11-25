@@ -2507,3 +2507,33 @@ fn xma_integer_log2_matches_the_formats_function() {
         assert_eq!(got, want, "{backend}: log2({:#x})", inputs[0]);
     });
 }
+
+/// `victory_formats::bcpack::interleave`, the function the test below runs as console code.
+fn interleave_reference(a: u8, b: u8) -> u8 {
+    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
+    spread(a) | spread(b) << 1
+}
+
+/// BCPack's interleave of two 4-bit symbols, written as console code, matches the formats
+/// crate's function on the GPU: every pair of symbols, with and without bits above the
+/// nibble that the function ignores.
+#[test]
+fn bcpack_symbol_interleave_matches_the_formats_function() {
+    // v1 = the first symbol, on the even bits; v2 = the second, on the odd ones.
+    let mut body = vec![vop1(0x001, 0, 128)]; // v_mov_b32 v0, 0
+    for bit in 0u16..4 {
+        for (symbol, position) in [(1, 2 * bit), (2, 2 * bit + 1)] {
+            body.extend(vop3(0x148, 3, vgpr(symbol), 128 + bit, 129)); // v_bfe_u32 v3, symbol, bit, 1
+            body.extend(vop3(0x36F, 0, vgpr(3), 128 + position, vgpr(0))); // v_lshl_or_b32 v0, v3, position, v0
+        }
+    }
+    let shader = build_valu_cs(&body);
+    let mut cases: Vec<[u32; 4]> = (0u32..256)
+        .map(|pair| [pair & 15, pair >> 4, 0, 0])
+        .collect();
+    cases.extend((0u32..16).map(|a| [a | 0xF0, (15 - a) | 0xA0, 0, 0]));
+    run_cases(&shader, &cases, |backend, _, [a, b, ..], got| {
+        let want = u32::from(interleave_reference(a as u8, b as u8));
+        assert_eq!(got, want, "{backend}: interleave({a:#x}, {b:#x})");
+    });
+}
