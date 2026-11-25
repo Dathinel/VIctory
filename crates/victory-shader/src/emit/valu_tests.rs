@@ -255,12 +255,23 @@ fn forced_warp_runs_only_the_software_backend() {
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    run_cases_on(shader, cases, backends(force_warp), check);
+}
+
+/// [`run_cases`] on the given backends only (WARP cannot pin a wave size,
+/// which the lane-aware programs ask for).
+fn run_cases_on(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    backends: &[(&str, bool)],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-    for &(label, warp) in backends(force_warp) {
+    for &(label, warp) in backends {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -1757,6 +1768,29 @@ fn cmp16_sdwa_preserves_word_selects() {
     }
 }
 
+/// A carry-in whose mask is a plain SGPR (a root constant) the structure pass
+/// does not follow: this lane adds its own bit of the number.
+#[test]
+fn v_add_co_ci_on_an_untracked_mask_adds_this_lanes_bit() {
+    // v_add_co_ci_u32_e64 v0, s12, v1, v2, s3 (VOP3B 0x128; s12 takes the carry out).
+    let mut op = vop3(0x128, 0, vgpr(1), vgpr(2), sgpr(3));
+    op[0] |= 12 << 8;
+    let shader = build_valu_cs(&op);
+    run_cases_on(
+        &shader,
+        &[
+            [10, 20, 0, 0],
+            [10, 20, 0, 1],
+            [10, 20, 0, 2],
+            [10, 20, 0, !0],
+        ],
+        &[("hardware", false)],
+        |label, i, inp, got| {
+            assert_eq!(got, inp[0] + inp[1] + (inp[3] & 1), "{label} case {i}");
+        },
+    );
+}
+
 /// Inline float constants on 16-bit integer ops keep their f32 bits: `1.0`
 /// is `0x3F80_0000` (low half 0), not f16 `0x3C00` (VIC-BT-021 / #438).
 #[test]
@@ -2195,4 +2229,20 @@ fn bcpack_pixel_pair_residuals_match_the_formats_function() {
         let want = u32::from(ix[2 * k]) | u32::from(ix[2 * k + 1]) << 8;
         assert_eq!(got, want, "{backend}: pairs, symbol {}", inputs[0]);
     });
+}
+
+/// A select on an inline 0 or -1 mask picks src0 or src1 in every lane.
+#[test]
+fn v_cndmask_on_an_inline_mask_picks_one_side() {
+    for (mask, pick) in [(128u16, 0usize), (193, 1)] {
+        let k = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), mask));
+        run_cases_on(
+            &k,
+            &[[10, 20, 0, 0]],
+            &[("hardware", false)],
+            |label, _, inp, got| {
+                assert_eq!(got, inp[pick], "{label} inline {mask}");
+            },
+        );
+    }
 }
