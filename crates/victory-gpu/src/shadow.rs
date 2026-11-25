@@ -190,6 +190,14 @@ impl Shadow {
         );
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn read_test_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        let (start, end) = self.inside(address as usize, len);
+        // SAFETY: `self.data` is persistently mapped for `self.len` bytes and
+        // `inside` clamps `start..end` to `0..self.len`.
+        unsafe { std::slice::from_raw_parts(self.data.add(start), end - start) }.to_vec()
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -565,7 +573,52 @@ fn loose_budget_for_ram(total_ram_bytes: Option<u64>) -> u64 {
     }
 }
 
+#[cfg(all(test, windows))]
+static TEST_LOOSE_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(test, windows))]
+static TEST_LOOSE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(all(test, windows))]
+pub(crate) struct LooseBudgetGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, windows))]
+impl Drop for LooseBudgetGuard {
+    fn drop(&mut self) {
+        TEST_LOOSE_BUDGET.store(0, Ordering::SeqCst);
+        let drained: Vec<Arc<Shadow>> = {
+            let mut guard = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            guard.total_bytes = 0;
+            std::mem::take(&mut guard.entries).into_values().collect()
+        };
+        drop(drained);
+    }
+}
+
+/// Test-only helper that clears the global loose shadow cache and forces an
+/// explicit byte budget until the returned guard drops.
+#[cfg(all(test, windows))]
+pub(crate) fn isolated_loose_budget(budget: u64) -> LooseBudgetGuard {
+    let lock = TEST_LOOSE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut guard = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        guard.total_bytes = 0;
+        guard.entries.clear();
+    }
+    TEST_LOOSE_BUDGET.store(budget, Ordering::SeqCst);
+    LooseBudgetGuard { _lock: lock }
+}
+
 fn loose_budget() -> u64 {
+    #[cfg(all(test, windows))]
+    {
+        let override_budget = TEST_LOOSE_BUDGET.load(Ordering::SeqCst);
+        if override_budget != 0 {
+            return override_budget;
+        }
+    }
     static BUDGET: OnceLock<u64> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let ram = total_physical_ram_bytes();

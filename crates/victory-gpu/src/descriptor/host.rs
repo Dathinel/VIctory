@@ -128,6 +128,16 @@ impl TexTracker {
     }
 }
 
+/// Backing host resource held by a descriptor slot in [`HostHeap::kept`].
+///
+/// Buffer descriptors backed by a [`Shadow`] retain the `Arc<Shadow>` itself
+/// (not just its `ID3D12Resource`) so [`crate::shadow`] cannot evict a loose
+/// shadow window while a live descriptor slot still names its buffer.
+enum KeptBacking {
+    Resource { _resource: ID3D12Resource },
+    Shadow { _shadow: Arc<Shadow> },
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -140,11 +150,13 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
-    /// The host resource each slot views, held while the slot does: shaders
-    /// index heaps directly, so a slot the title has not rewritten since it
-    /// released the resource may still be read, and a freed host resource
-    /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// The host resource (or [`Shadow`]) each slot views, held while the slot
+    /// does: shaders index heaps directly, so a slot the title has not
+    /// rewritten since it released the resource may still be read, and a freed
+    /// host resource read there is a GPU page fault (the console reads stale
+    /// memory). Retaining `Arc<Shadow>` also keeps loose shadow windows pinned
+    /// in the shadow cache while any descriptor slot references their buffer.
+    kept: Mutex<Vec<Option<KeptBacking>>>,
     /// Slots requiring submission-time title-memory refresh (`UnalignedCopy`
     /// uploads or aliased structured SRV shadows).
     refreshes: Mutex<HashMap<u32, SlotRefresh>>,
@@ -340,7 +352,7 @@ impl HostHeap {
             spare: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new((0..(count + extra)).map(|_| None).collect()),
             refreshes: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
@@ -501,10 +513,33 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        let slot_start = first as usize;
+        let slot_end = self.count as usize + end;
+        let retired: Vec<KeptBacking> = {
+            let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slice) = slots.get_mut(slot_start..slot_end) {
+                slice.iter_mut().filter_map(Option::take).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        {
+            let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+            if !map.is_empty() {
+                for index in slot_start..slot_end {
+                    map.remove(&(index as u32));
+                }
+            }
+        }
+        {
+            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+                slots.fill(false);
+            }
+        }
+        for old in retired {
+            crate::host::retire(old);
         }
     }
 
@@ -563,10 +598,17 @@ impl HostHeap {
     fn keep(&self, index: u32, kept: Kept) {
         let (resource, refresh) = match kept {
             Kept::Empty => (None, None),
-            Kept::Resource(r) => (Some(r), None),
-            Kept::Texture { resource, .. } => (Some(resource), None),
+            Kept::Shadow(s) => (Some(KeptBacking::Shadow { _shadow: s }), None),
+            Kept::Texture { resource, .. } => (
+                Some(KeptBacking::Resource {
+                    _resource: resource,
+                }),
+                None,
+            ),
             Kept::Unaligned(copy) => (
-                Some(copy.resource.clone()),
+                Some(KeptBacking::Resource {
+                    _resource: copy.resource.clone(),
+                }),
                 Some(SlotRefresh::Unaligned(copy)),
             ),
             Kept::AliasedShadow {
@@ -574,7 +616,9 @@ impl HostHeap {
                 address,
                 len,
             } => (
-                Some(shadow.buffer.clone()),
+                Some(KeptBacking::Shadow {
+                    _shadow: shadow.clone(),
+                }),
                 Some(SlotRefresh::Shadow {
                     shadow,
                     address,
@@ -582,15 +626,17 @@ impl HostHeap {
                 }),
             ),
         };
-        let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = slots.get_mut(index as usize) {
+        let old = {
+            let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            slots
+                .get_mut(index as usize)
+                .and_then(|slot| std::mem::replace(slot, resource))
+        };
+        if let Some(old) = old {
             // A running submission may still read the old resource through
             // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
-            }
+            crate::host::retire(old);
         }
-        drop(slots);
         let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
         match refresh {
             Some(entry) => {
@@ -653,10 +699,10 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
-    /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
+    /// of `shadow` from byte `offset` (a multiple of 16): a root SRV with a
     /// size, whose reads past it return zeros instead of reaching whatever
     /// the host placed after the buffer.
-    pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+    pub(crate) fn raw_at(&self, index: u32, shadow: &Arc<Shadow>, offset: u64, len: u64) {
         let Some(elements) = raw_element_count(len) else {
             self.null_raw_at(index);
             return;
@@ -678,9 +724,9 @@ impl HostHeap {
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+                .CreateShaderResourceView(&shadow.buffer, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Kept::Resource(buffer.clone()));
+        self.keep(index, Kept::Shadow(Arc::clone(shadow)));
     }
 
     /// Makes slot `index` a raw buffer view that reads zeros.
@@ -690,10 +736,10 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view with unordered
-    /// access of `len` bytes of `buffer` from byte `offset` (a multiple of
+    /// access of `len` bytes of `shadow` from byte `offset` (a multiple of
     /// 16): a root UAV with a size, whose writes past it are dropped
     /// instead of reaching whatever the host placed after the buffer.
-    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+    pub(crate) fn raw_uav_at(&self, index: u32, shadow: &Arc<Shadow>, offset: u64, len: u64) {
         let Some(host) = host() else { return };
         let Some(elements) = raw_element_count(len) else {
             self.null_raw_uav_at(index);
@@ -703,13 +749,13 @@ impl HostHeap {
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device.CreateUnorderedAccessView(
-                buffer,
+                &shadow.buffer,
                 None::<&ID3D12Resource>,
                 Some(&desc),
                 self.cpu(index),
             )
         };
-        self.keep(index, Kept::Resource(buffer.clone()));
+        self.keep(index, Kept::Shadow(Arc::clone(shadow)));
     }
 
     /// Makes slot `index` a raw buffer view with unordered access of no
@@ -1159,7 +1205,7 @@ fn raw_start_fits(first: u64) -> bool {
 /// The host resource a slot made by [`make`] views, if any.
 enum Kept {
     Empty,
-    Resource(ID3D12Resource),
+    Shadow(Arc<Shadow>),
     /// A host texture SRV or UAV, carrying the title `Resource` address and
     /// access kind so [`HostHeap::mirror`] can track it without re-reading the
     /// title pointer after `make`.
@@ -1323,7 +1369,7 @@ fn buffer_srv_inner(
             len: bytes,
         })
     } else {
-        Some(Kept::Resource(shadow.buffer.clone()))
+        Some(Kept::Shadow(shadow))
     }
 }
 
@@ -1388,7 +1434,7 @@ fn buffer_uav(
             at,
         )
     };
-    Some(Kept::Resource(shadow.buffer.clone()))
+    Some(Kept::Shadow(shadow))
 }
 
 /// Whether the host lets views of a typed resource name another format of
@@ -1741,7 +1787,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Kept::Resource(shadow.buffer.clone()))
+            Some(Kept::Shadow(shadow))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -3461,5 +3507,106 @@ void main() {
 
         // SAFETY: plain device health query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn descriptor_table_over_128_mib_loose_budget_keeps_first_shadow_for_refresh() {
+        let _retire = crate::host::isolated_retire_scope();
+        let _budget = crate::shadow::isolated_loose_budget(128 << 20);
+        let Some(host) = host() else {
+            return;
+        };
+        let heap = HostHeap::root_views().expect("root view heap");
+        let count = 33u32;
+        let first = heap.dynamic(count).expect("33 dynamic slots");
+
+        #[repr(align(16))]
+        struct Aligned([u32; 16]);
+        let mut backing = Aligned([0x1111_1111; 16]);
+        let addr0 = (&raw const backing.0) as u64;
+
+        let mut slot_mem = [0u64; 16];
+        let h0 = placed_raw_srv_handle(&mut slot_mem, addr0, 64, 0, 16);
+        let view0 = crate::descriptor::view(h0).expect("placed raw srv 0");
+        assert!(heap.make_at(first, &view0), "slot 0 raw srv must succeed");
+
+        let s0_initial = crate::shadow::find(addr0, 64).expect("loose shadow 0");
+        let weak0 = Arc::downgrade(&s0_initial);
+        let initial_gpu = s0_initial.gpu(addr0);
+        drop(s0_initial);
+        // `LOOSE` holds 1 strong ref and `heap.kept[first]` holds 1 strong ref.
+        assert_eq!(weak0.strong_count(), 2);
+
+        // Populate 32 more distinct 4 MiB loose windows in the same table
+        // (33 * 4 MiB = 132 MiB > 128 MiB budget). Because every live slot
+        // pins its `Arc<Shadow>`, slot 0's shadow must not be evicted.
+        let synthetic_base = 0x2000_0000_0000_u64;
+        let mut weak1 = None;
+        for i in 1..count {
+            let addr = synthetic_base + u64::from(i) * (4 << 20);
+            let h = placed_raw_srv_handle(&mut slot_mem, addr, 64, 0, 16);
+            let view = crate::descriptor::view(h).expect("placed raw srv");
+            assert!(
+                heap.make_at(first + i, &view),
+                "slot {i} raw srv must succeed"
+            );
+            if i == 1 {
+                weak1 = Some(Arc::downgrade(
+                    &crate::shadow::find(addr, 64).expect("loose shadow 1"),
+                ));
+            }
+        }
+        let weak1 = weak1.expect("window 1 weak ref");
+
+        // Later refresh lookup must resolve the exact same `Arc<Shadow>` whose
+        // buffer slot 0 points to, not a newly allocated replacement.
+        let s0_after = crate::shadow::find(addr0, 64).expect("loose shadow 0 still cached");
+        assert_eq!(
+            s0_after.gpu(addr0),
+            initial_gpu,
+            "slot 0 descriptor must still name the same shadow buffer after >32 windows"
+        );
+        assert!(
+            weak0
+                .upgrade()
+                .is_some_and(|orig| Arc::ptr_eq(&orig, &s0_after)),
+            "refresh must target the exact Arc<Shadow> retained by slot 0"
+        );
+
+        // Mutating title memory and refreshing writes into the exact shadow
+        // buffer pinned by slot 0 when submitted.
+        backing.0.fill(0x5A5A_5A5A);
+        let list = host.new_list().expect("host list");
+        s0_after.refresh(&list, addr0, 64);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        let copied = s0_after.read_test_bytes(addr0, 64);
+        assert_eq!(copied, vec![0x5Au8; 64]);
+        drop(s0_after);
+
+        // Once the dynamic table slots are released, descriptor-free idle
+        // windows become eligible for LRU eviction again.
+        heap.release(first, count);
+        assert_eq!(
+            weak0.strong_count(),
+            1,
+            "releasing dynamic slots must drop HostHeap's Arc<Shadow> pin"
+        );
+        assert_eq!(
+            weak1.strong_count(),
+            1,
+            "releasing dynamic slots must unpin window 1 as well"
+        );
+        // Window 1 is now the oldest untouched entry (window 0 was refreshed
+        // above); inserting one more window drains the cache back to 32 entries
+        // and evicts window 1 immediately.
+        let extra_addr = synthetic_base + 40 * (4 << 20);
+        let _extra = crate::shadow::find(extra_addr, 64).expect("extra loose window");
+        assert_eq!(
+            weak1.strong_count(),
+            0,
+            "idle LRU loose window must be evicted once no descriptor slot pins it"
+        );
     }
 }
