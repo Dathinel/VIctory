@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
-use super::xgameruntime::{HRESULT, S_OK};
+use super::xgameruntime::{E_NOINTERFACE, E_POINTER, Guid, HRESULT, IID_IUNKNOWN, S_OK};
 use crate::{HleExport, HleModule};
 
 /// The documented errors.
@@ -27,9 +27,26 @@ pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
-const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
-const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
-const IID_IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+
+/// Public GameInput v0 interface ids (GDK `GameInput.h`).
+const IID_IGAMEINPUT: Guid = Guid::new(
+    0x11BE_2A7E,
+    0x4254,
+    0x445A,
+    [0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00, 0x69, 0x18],
+);
+const IID_IGAMEINPUT_DEVICE: Guid = Guid::new(
+    0x31DD_86FB,
+    0x4C1B,
+    0x408A,
+    [0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4, 0x71, 0x25],
+);
+const IID_IGAMEINPUT_READING: Guid = Guid::new(
+    0x2156_947A,
+    0xE1FA,
+    0x4DE0,
+    [0xA3, 0x0B, 0xD8, 0x12, 0x93, 0x1D, 0xBD, 0x8D],
+);
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -640,17 +657,21 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     }
 }
 
-fn query_iunknown<T>(
+/// `QueryInterface` for an input object: `IID_IUnknown` and the object's own
+/// interface id succeed (`AddRef`, `S_OK`); anything else clears `*out`.
+fn query_iid<T>(
     this: *const T,
-    iid: *const [u8; 16],
+    iid: *const Guid,
     out: Out,
     retain: extern "system" fn(*const T) -> u32,
+    self_iid: &Guid,
 ) -> HRESULT {
     if iid.is_null() || out.is_null() {
         return fail(out, E_POINTER);
     }
     // SAFETY: the caller passes a readable IID, checked non-null above.
-    if unsafe { *iid } != IID_IUNKNOWN {
+    let asked = unsafe { *iid };
+    if asked != IID_IUNKNOWN && asked != *self_iid {
         return fail(out, E_NOINTERFACE);
     }
     retain(this);
@@ -659,8 +680,11 @@ fn query_iunknown<T>(
     S_OK
 }
 
-extern "system" fn query_interface(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
-    query_iunknown(this, iid, out, add_ref)
+extern "system" fn query_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_iid(this, iid, out, add_ref, &IID_IGAMEINPUT)
+}
+extern "system" fn device_query(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_iid(this, iid, out, add_ref, &IID_IGAMEINPUT_DEVICE)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -1043,7 +1067,7 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
 }
 
 static DEVICE: Table<21> = Table([
-    query_interface as *const (),     // 0x00
+    device_query as *const (),        // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
@@ -1070,8 +1094,14 @@ fn reading<'a>(this: *const Reading) -> &'a Reading {
     // SAFETY: a reading we handed out and the title still holds.
     unsafe { &*this }
 }
-extern "system" fn reading_query(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
-    query_iunknown(this.cast(), iid, out, reading_add_ref)
+extern "system" fn reading_query(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_iid(
+        this.cast(),
+        iid,
+        out,
+        reading_add_ref,
+        &IID_IGAMEINPUT_READING,
+    )
 }
 extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
@@ -1650,8 +1680,8 @@ mod tests {
     }
 
     #[test]
-    fn query_interface_returns_iunknown_and_retains_the_reading() {
-        type Query = extern "system" fn(*const c_void, *const [u8; 16], Out) -> HRESULT;
+    fn query_interface_returns_iunknown_own_iid_and_retains_the_reading() {
+        type Query = extern "system" fn(*const c_void, *const Guid, Out) -> HRESULT;
         let (hub, _) = fake();
         let reading = Ref::new(Reading {
             vtable: &READING,
@@ -1662,16 +1692,29 @@ mod tests {
             value: Value::Pad(PadState::default()),
         });
         let reading_ptr = reading.0.as_ptr().cast_const();
-        for object in [
-            std::ptr::from_ref(&hub.object).cast(),
-            std::ptr::from_ref(&hub.devices[FALLBACK]).cast(),
-            reading_ptr.cast(),
-        ] {
+        let cases = [
+            (std::ptr::from_ref(&hub.object).cast(), &IID_IGAMEINPUT),
+            (
+                std::ptr::from_ref(&hub.devices[FALLBACK]).cast(),
+                &IID_IGAMEINPUT_DEVICE,
+            ),
+            (reading_ptr.cast(), &IID_IGAMEINPUT_READING),
+        ];
+        for (object, self_iid) in cases {
             let query = slot::<Query, _>(object, 0);
             let mut out = std::ptr::null();
             assert_eq!(query(object, &IID_IUNKNOWN, &mut out), S_OK);
             assert_eq!(out, object);
-            assert_eq!(query(object, &[0; 16], &mut out), E_NOINTERFACE);
+            out = std::ptr::null();
+            assert_eq!(query(object, self_iid, &mut out), S_OK);
+            assert_eq!(out, object);
+            // Another interface's id is not ours.
+            let foreign = if *self_iid == IID_IGAMEINPUT {
+                &IID_IGAMEINPUT_DEVICE
+            } else {
+                &IID_IGAMEINPUT
+            };
+            assert_eq!(query(object, foreign, &mut out), E_NOINTERFACE);
             assert!(out.is_null());
             out = object;
             assert_eq!(query(object, std::ptr::null(), &mut out), E_POINTER);
@@ -1681,9 +1724,11 @@ mod tests {
                 E_POINTER
             );
         }
-        assert_eq!(reading.refs.load(Ordering::Relaxed), 2);
+        // IUnknown once and own iid once; the reading started at 1.
+        assert_eq!(reading.refs.load(Ordering::Relaxed), 3);
         drop(reading);
         let release = slot::<extern "system" fn(*const Reading) -> u32, _>(reading_ptr, 0x10);
+        assert_eq!(release(reading_ptr), 1);
         assert_eq!(release(reading_ptr), 0);
     }
 

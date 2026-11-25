@@ -959,6 +959,7 @@ impl<'a> Tracer<'a> {
         if inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -992,6 +993,7 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1036,6 +1038,7 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1070,6 +1073,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -3487,6 +3491,27 @@ pub(crate) mod tests {
         // s_getpc_b64 is the first instruction: its next one is at 4.
         assert_eq!(a.offset, 4 + 0xDDC);
         assert!(a.dynamic.is_some(), "the index stays a computed term");
+    }
+
+    /// VOP3 integer `clamp` saturates; address analysis must not treat the
+    /// sum as wrapping or it would fold `getpc` constants that a saturated
+    /// add never produces (VIC-BT-010 / resource side of #675).
+    #[test]
+    fn clamped_vector_add_is_not_wrapping_address_math() {
+        let mut words = CODE_TABLE_FIRST_LANE.to_vec();
+        let lo = words.iter().position(|&w| w == 0xD70F_6A01).unwrap();
+        words[lo] |= 1 << 15; // clamp on v_add_co_u32
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 48,
+                what: "an address not from a root parameter"
+            },
+            "{err:?}"
+        );
     }
 
     /// [`CODE_TABLE_FIRST_LANE`] with the low dword's add taking a carry-in

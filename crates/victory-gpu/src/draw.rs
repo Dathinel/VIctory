@@ -189,6 +189,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// [`descriptor::heap_bind_id`] for each of [`Self::host_heaps`] when
+    /// last bound; catches a new heap reused at the same title address.
+    host_heap_ids: [u64; 2],
     /// Tables made afresh in this list, keyed by title heap, `list.copy_gen()`,
     /// slot count, and hashed descriptor records. Partitioning by `copy_gen`
     /// preserves `Fill -> Copy -> Fill` ordering for CBV snapshots across
@@ -367,6 +370,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_heap_ids = [0; 2];
         if self.topology != 0 {
             self.set_topology(new_list, self.topology);
         }
@@ -892,11 +896,22 @@ impl State {
         if keys[0] == 0 && needs_root_heap {
             keys[0] = crate::descriptor::ROOT_VIEW_HEAP;
         }
-        if keys != self.host_heaps {
+        let ids = [
+            crate::descriptor::heap_bind_id(keys[0]),
+            crate::descriptor::heap_bind_id(keys[1]),
+        ];
+        // Compare creation ids as well as pointers: a released heap's
+        // address may be reused by a new heap (ABA), which still needs a
+        // fresh `SetDescriptorHeaps`.
+        if keys != self.host_heaps || ids != self.host_heap_ids {
             let mut heaps = Vec::new();
-            for key in keys {
+            for (key, id) in keys.into_iter().zip(ids) {
                 if key == 0 {
                     continue;
+                }
+                if key != crate::descriptor::ROOT_VIEW_HEAP && id == 0 {
+                    once!("a bound descriptor heap was released");
+                    return false;
                 }
                 let Some(heap) = crate::descriptor::recording_heap(key) else {
                     once!("a bound descriptor heap could not be created on the host");
@@ -908,6 +923,7 @@ impl State {
             // SAFETY: an open list and shader-visible heaps retained for the recording.
             unsafe { list.list.SetDescriptorHeaps(&heaps) };
             self.host_heaps = keys;
+            self.host_heap_ids = ids;
             self.host_roots = [0; 2];
         }
         true
@@ -2515,7 +2531,12 @@ mod tests {
         let mut state = State::default();
         assert!(state.bind_heaps(&list, true));
         assert_eq!(state.host_heaps, [crate::descriptor::ROOT_VIEW_HEAP, 0]);
+        assert_eq!(state.host_heap_ids, [u64::MAX, 0]);
         assert_eq!(state.heaps, [0, 0]);
+        // Same title keys and creation ids must not re-bind.
+        let bound = (state.host_heaps, state.host_heap_ids);
+        assert!(state.bind_heaps(&list, true));
+        assert_eq!((state.host_heaps, state.host_heap_ids), bound);
         for ((root, pso), dst, src) in [(&first, src.0, None), (&second, dst.0, Some(src.0))] {
             // SAFETY: an open list and matching live root signature and pipeline.
             unsafe {
@@ -2931,6 +2952,7 @@ mod depth_tests {
         state.host_pipeline = 0x1234;
         state.host_roots = [0x11, 0x22];
         state.host_heaps = [0x33, 0x44];
+        state.host_heap_ids = [0x55, 0x66];
         state.fresh_tables.insert(
             FreshTableKey {
                 heap: 0xdead,
@@ -2956,6 +2978,7 @@ mod depth_tests {
         assert_eq!(state.host_pipeline, 0);
         assert_eq!(state.host_roots, [0; 2]);
         assert_eq!(state.host_heaps, [0; 2]);
+        assert_eq!(state.host_heap_ids, [0; 2]);
         assert_eq!(state.topology, 4);
         assert_eq!(state.viewports.len(), 1);
         assert_eq!(state.viewports[0].Width, 64.0);
