@@ -2438,6 +2438,11 @@ void main() {
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
+    ///
+    /// Exercises buffer→texture staging via `defer_fill` (host-owned mapped
+    /// upload). Under Wine+vkd3d that path must not use `defer_copy`, or
+    /// `VirtualQuery` reporting Map memory as MEM_FREE skips the upload and
+    /// this reads zeros (#518).
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {

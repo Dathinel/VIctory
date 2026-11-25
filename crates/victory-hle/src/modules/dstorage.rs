@@ -1064,8 +1064,8 @@ fn into_destination(
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+    if let Some(window) = super::xmem::page_window(pages, offset, len) {
+        return window.fill(fill);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;

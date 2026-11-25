@@ -822,9 +822,12 @@ const RECT_ARGS_MIN: u64 = 64 << 10;
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
-    /// buffer copies, which later refreshes must see.
+    /// buffer copies, which later refreshes must see. Runs with
+    /// `title_dst = true` so unmapped title pages keep the commitment guard.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
+    /// A copy of title memory into the list's own upload memory. Runs with
+    /// `title_dst = false`: the destination is host-mapped, so Wine/vkd3d
+    /// `VirtualQuery` quirks must not skip it (#518).
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
@@ -1965,7 +1968,13 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Copies `len` bytes from `src` to `dst` when the list is submitted.
+    /// Copies `len` bytes from `src` to title memory at `dst` when the list
+    /// is submitted (`Step::Copy` → `copy_mapped(..., title_dst = true)`).
+    ///
+    /// Title destinations keep the `VirtualQuery` commitment guard. Host-owned
+    /// mapped upload memory must use [`Self::defer_fill`] instead: under
+    /// Wine+vkd3d, `Map` pointers can report as `MEM_FREE` and the guard would
+    /// skip the copy (#518).
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.mark_work();
         let mut deferred = self.deferred();
@@ -1984,8 +1993,12 @@ impl HostList {
         self.deferred().copy_gen
     }
 
-    /// Copies `len` bytes of title memory at `src` into the list's upload
-    /// memory at `dst` when the list is submitted.
+    /// Copies `len` bytes of title memory at `src` into host-owned upload
+    /// memory at `dst` when the list is submitted (`Step::Fill` →
+    /// `copy_mapped(..., title_dst = false)`).
+    ///
+    /// Buffer→texture staging in `copy_texture_region` uses this; buffer→buffer
+    /// title copies stay on [`Self::defer_copy`].
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.mark_work();
         self.deferred()
@@ -2470,6 +2483,12 @@ impl Batch {
 /// destination (`title_dst`) that is not all mapped takes nothing from its
 /// first unmapped page on.
 ///
+/// Host-owned staging uploads pass `title_dst = false` (`Step::Fill` /
+/// [`HostList::defer_fill`]): those destinations are known mapped, and under
+/// Wine+vkd3d `VirtualQuery` can report them as `MEM_FREE`, so the commitment
+/// guard must not apply (#518). Title buffer destinations keep `title_dst =
+/// true` (`Step::Copy` / [`HostList::defer_copy`]).
+///
 /// The copy runs in the kernel (`ReadProcessMemory`), which reports an
 /// unmapped page of the source, or of the destination it writes, instead of
 /// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
@@ -2804,6 +2823,25 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    /// Host-owned staging (`title_dst = false`, `defer_fill`) still copies;
+    /// title destinations (`title_dst = true`, `defer_copy`) keep the
+    /// commitment guard. Wine+vkd3d can report Map memory as MEM_FREE, which
+    /// is why buffer→texture staging must not use the title path (#518).
+    #[test]
+    fn host_staging_fill_copies_while_title_dst_keeps_the_commitment_guard() {
+        let from = pattern();
+        // Fill path: a heap buffer stands in for mapped upload memory.
+        let mut staging = vec![0u8; BLOCK];
+        copy_mapped(staging.as_mut_ptr(), from.as_ptr(), BLOCK, false);
+        assert_eq!(&staging[..], &from[..BLOCK]);
+        // Copy path: an unmapped hole in the title destination stops the
+        // write; the trailing committed block stays untouched.
+        let title = holed(0xee);
+        copy_mapped(title, from.as_ptr(), 3 * BLOCK, true);
+        assert!(block(title, 2).iter().all(|&b| b == 0xee));
+        release(title);
     }
 
     // Run on both revisions with --ignored --nocapture to measure the active path.

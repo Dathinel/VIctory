@@ -6,9 +6,10 @@
 //! * Connects (also by name, by list, `ConnectEx` from `WSAIoctl`) and
 //!   datagram sends to anything but 127.0.0.0/8 and ::1 fail with
 //!   `WSAENETUNREACH`.
-//! * Forward lookups other than `localhost` and IP literals fail with
-//!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
-//!   numeric, or fail if a name is required, as with no network.
+//! * Forward lookups other than `localhost`, the local hostname
+//!   (`gethostname`), and IP literals fail with `WSAHOST_NOT_FOUND`;
+//!   reverse lookups of other addresses come back numeric, or fail if a
+//!   name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
 //!   exist for one. Automatic redirects are disabled, including redirects
@@ -1399,6 +1400,13 @@ mod tests {
         let _winsock = start_winsock();
         for ok in [None, Some(""), Some("localhost"), Some("192.0.2.1")] {
             assert!(resolvable(ok.map(String::from)), "{ok:?}");
+        }
+        // Local hostname from gethostname — no DNS; compare against the cache.
+        if let Some(host) = local_hostname() {
+            assert!(resolvable(Some(host.clone())), "{host}");
+            assert!(resolvable(Some(host.to_ascii_uppercase())), "{host}");
+            assert!(reachable_name(Some(host.clone())), "{host}");
+            assert!(!resolvable(Some(format!("{host}.example"))), "{host}");
         }
         assert!(!resolvable(Some("blocked.invalid".into())));
         assert_eq!(wsa_last_error(), WSAHOST_NOT_FOUND);

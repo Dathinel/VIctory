@@ -791,8 +791,11 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
+            // Host-owned mapped upload (not title memory): `defer_fill` so
+            // `copy_mapped` skips the title-destination VirtualQuery guard.
+            // Wine+vkd3d can report Map memory as MEM_FREE; `defer_copy` would
+            // then skip the upload (#518). Buffer→buffer title destinations
+            // above keep `defer_copy`.
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
