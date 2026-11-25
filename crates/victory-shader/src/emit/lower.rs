@@ -2956,6 +2956,44 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// `value` when console lane `lane` is in EXEC, else 0. Cross-lane reads
+    /// such as `ds_swizzle_b32` return 0 from an inactive source lane rather
+    /// than the stale VGPR `waveReadLaneAt` would see.
+    fn active_lane_or_zero(&mut self, value: V, lane: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let yes = self.s.m.bool(true);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        self.s.flags |= flags::WAVE_OPS;
+        let (k5, k31, one, z) = (
+            self.s.m.i32(5),
+            self.s.m.i32(31),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let words = match self.s.wave_size {
+            Some(32) => 1,
+            Some(64) => 2,
+            _ => 4,
+        };
+        let word_idx = self.s.m.bin(c, Bin::LShr, lane, k5);
+        let mut word = self.s.m.extract(c, ballot, 0);
+        for j in 1..words {
+            let kj = self.s.m.i32(j);
+            let wj = self.s.m.extract(c, ballot, j);
+            let is = self.s.m.cmp(c, pred::EQ, word_idx, kj);
+            word = self.s.m.select(c, is, wj, word);
+        }
+        let sh = self.s.m.bin(c, Bin::And, lane, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        let on = self.s.m.cmp(c, pred::NE, bit, z);
+        self.s.m.select(c, on, value, z)
+    }
+
     /// Coarse derivatives of `coords` across this lane's quad, as DXIL
     /// gradients (x for up to three coordinates, then y), each times
     /// `scale` if given.
@@ -3075,6 +3113,8 @@ impl<'a> Lower<'a> {
             } else {
                 self.read_lane(x, src)
             };
+            // Inactive source lanes return 0, not the stale VGPR.
+            let r = self.active_lane_or_zero(r, src);
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());

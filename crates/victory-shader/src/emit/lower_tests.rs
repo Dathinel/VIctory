@@ -239,6 +239,21 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     lower_words(words, rsrc2).map(|_| ())
 }
 
+/// `ds_swizzle_b32` must ballot-mask inactive source lanes to 0 (VIC-BT-018):
+/// a plain `waveReadLaneAt` would otherwise return a stale VGPR.
+#[test]
+fn ds_swizzle_b32_zeros_inactive_source_lanes() {
+    // s_mov_b32 exec_lo, 0x5555 (odd lanes inactive); ds_swizzle_b32 v1, v0
+    // offset:0x41f (and:0x1f or:0 xor:1 — exchange with the neighbour).
+    let words = [0xBEFE_03FF, 0x0000_5555, 0xD8D4_041F, 0x0100_0000, S_ENDPGM];
+    let lowered = lower_words(&words, 0).expect("ds_swizzle_b32 lowers");
+    assert!(
+        lowered.has_wave_ballot,
+        "ds_swizzle_b32 must ballot-mask inactive source lanes to 0"
+    );
+    assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
+}
+
 #[test]
 fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
