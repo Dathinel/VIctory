@@ -7393,7 +7393,7 @@ mod plane_shaders {
 
         let mut batch = super::Batch::default();
         let mut submitted = 0u64;
-        list.run_deferred(&mut batch, &host, &mut submitted);
+        list.run_deferred(&mut batch, host, &mut submitted);
         waiter.join().unwrap();
         assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 0x5A);
         list.close();
