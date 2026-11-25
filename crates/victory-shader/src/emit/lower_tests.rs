@@ -254,6 +254,122 @@ fn ds_swizzle_b32_zeros_inactive_source_lanes() {
     assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
 }
 
+/// A wave64 mesh shader's quad swizzle asks the ballot about the source's
+/// host lane (quad-local, from `waveGetLaneIndex`), not its console lane
+/// number: console lanes 32..63 have no bit in a wave32 host's ballot.
+#[test]
+fn mesh_quad_swizzle_checks_the_host_lane_of_its_source() {
+    // ds_swizzle_b32 v1, v0 offset:0x80b1 (quad mode, pairs swapped).
+    let words = [0xD8D4_80B1, 0x0100_0000, S_ENDPGM];
+    let native = NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 4,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ms(crate::native::MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads: 64,
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, true, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("mesh quad swizzle lowers");
+    assert!(lowered.has_wave_ballot, "inactive sources still read 0");
+    assert!(
+        called(&lowered, "waveGetLaneIndex"),
+        "the ballot bit is the host lane's, not the console lane number"
+    );
+}
+
+/// A Valid-Mask export on one path in, bypassed on the other, joining a
+/// block with a plain `done` export: the lanes whose last guard was false
+/// still die (VIC-BT-011).
+#[test]
+fn pixel_discard_follows_a_vm_export_that_only_some_paths_run() {
+    let words = [
+        0xBE81_0380u32, // s_mov_b32 s1, 0
+        0xBF06_8001,    // s_cmp_eq_u32 s1, 0
+        0xBF85_0005,    // s_cbranch_scc1 over the narrowed export
+        0x7D84_0080,    // v_cmp_eq_u32 vcc, 0, v0
+        0xBE80_3C6A,    // s_and_saveexec_b32 s0, vcc_lo
+        0xF800_1090,    // exp null vm
+        0,
+        0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+        0xF800_080F, // exp mrt0 done
+        0,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            rsrc2: Default::default(),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let target = super::super::container::SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    assert!(io.exports.iter().any(|e| e.vm && !e.done));
+    assert!(io.exports.iter().any(|e| e.done && !e.vm));
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("partial-path vm export lowers");
+    assert!(
+        lowered.has_discard_op,
+        "lanes whose last Valid Mask guard was false must be discarded"
+    );
+}
+
 #[test]
 fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
