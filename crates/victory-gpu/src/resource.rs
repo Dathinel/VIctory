@@ -113,6 +113,7 @@ const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -135,13 +136,22 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
+/// Bytes, width and height of one storage block in a linear texture footprint.
+fn texture_element(format: u32) -> Option<(u64, u64, u64)> {
+    // Packed RGB formats store two adjacent texels in each 32-bit word.
+    if matches!(format, 68 | 69) {
+        return Some((4, 2, 1));
+    }
+    let (bytes, block) = element(format)?;
+    Some((bytes, block, block))
+}
+
 /// A texture's layout in console memory, as the console's layout library
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
-    const TEXTURE_2D: u32 = 3;
     const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     let dimension = match desc.dimension {
@@ -196,7 +206,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     let bytes = if desc.dimension == BUFFER {
         desc.width
     } else {
-        let (element, block) = element(desc.format)?;
+        let (element, block_width, block_height) = texture_element(desc.format)?;
         let (depth, slices) = if desc.dimension == TEXTURE_3D {
             (u64::from(desc.depth_or_array_size), 1)
         } else {
@@ -206,8 +216,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         let mips = mip_count(desc);
         let mut chain = 0u64;
         for mip in 0..mips.min(64) {
-            let w = (desc.width >> mip).max(1).div_ceil(block);
-            let h = (height >> mip).max(1).div_ceil(block);
+            let w = (desc.width >> mip).max(1).div_ceil(block_width);
+            let h = (height >> mip).max(1).div_ceil(block_height);
             let d = (depth >> mip).max(1);
             chain = chain.checked_add(w.checked_mul(h)?.checked_mul(d)?.checked_mul(element)?)?;
         }
@@ -356,11 +366,13 @@ impl PlacedFootprint {
     /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
     /// pitched but the last.
     pub(crate) fn layout(&self) -> Option<(u64, u64, u64)> {
-        let (element, block) = element(self.format)?;
+        let (element, block_width, block_height) = texture_element(self.format)?;
         let lines = u64::from(self.height)
-            .div_ceil(block)
+            .div_ceil(block_height)
             .checked_mul(u64::from(self.depth))?;
-        let row_bytes = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        let row_bytes = u64::from(self.width)
+            .div_ceil(block_width)
+            .checked_mul(element)?;
         if lines == 0 {
             return Some((0, row_bytes, 0));
         }
@@ -386,10 +398,23 @@ const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
     row_pitch: 0,
 };
 
-/// One subresource's size in an upload buffer: footprint (offset 0), rows
-/// and bytes per row. Planes of depth-stencil formats are not told apart.
+/// One subresource's upload footprint (offset 0), row count and unpadded row size.
 fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32, u64)> {
     const PITCH: u64 = 256;
+    // NV12 and P010 copy footprints require an even-sized 2D texture with one mip.
+    if matches!(desc.format, 103 | 104)
+        && (desc.dimension != TEXTURE_2D
+            || desc.mip_levels != 1
+            || desc.sample_count != 1
+            || !(1..=2048).contains(&desc.depth_or_array_size)
+            || desc.width < 2
+            || desc.width > u64::from(u32::MAX)
+            || desc.height < 2
+            || !desc.width.is_multiple_of(2)
+            || !desc.height.is_multiple_of(2))
+    {
+        return None;
+    }
     if desc.dimension == BUFFER {
         let footprint = PlacedFootprint {
             offset: 0,
@@ -397,7 +422,7 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
             width: u32::try_from(desc.width).ok()?,
             height: 1,
             depth: 1,
-            row_pitch: u32::try_from(desc.width.next_multiple_of(PITCH)).ok()?,
+            row_pitch: u32::try_from(desc.width.checked_next_multiple_of(PITCH)?).ok()?,
         };
         return (index == 0).then_some((footprint, 1, desc.width));
     }
@@ -407,35 +432,54 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     } else {
         u32::from(desc.depth_or_array_size).max(1)
     };
-    let (mip, slice) = (index % mips, index / mips);
-    if slice >= slices {
-        return None;
-    }
-    let (element, block) = element(desc.format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> mip)
+    let mip = index % mips;
+    let plane = index / mips / slices;
+    // Each plane contains all mips and array slices. Video chroma samples
+    // contain two components and cover a 2x2 luma region.
+    let (format, pitch_alignment, extent_shift) = match (desc.format, plane) {
+        (19..=22 | 44..=47, 0) => (39, 512, mip), // R32_TYPELESS
+        (19..=22 | 44..=47, 1) => (60, 512, mip), // R8_TYPELESS
+        (103, 0) => (60, 512, 0),                 // NV12 Y: R8_TYPELESS
+        (103, 1) => (48, 512, 1),                 // NV12 UV: R8G8_TYPELESS
+        (104, 0) => (53, 512, 0),                 // P010 Y: R16_TYPELESS
+        (104, 1) => (33, 512, 1),                 // P010 UV: R16G16_TYPELESS
+        (format, 0) => (format, PITCH, mip),
+        _ => return None,
+    };
+    let (element, block_width, block_height) = texture_element(format)?;
+    let width = desc
+        .width
+        .checked_shr(extent_shift)?
         .max(1)
-        .next_multiple_of(block);
+        .checked_next_multiple_of(block_width)?;
+    let height = u64::from(desc.height)
+        .checked_shr(extent_shift)?
+        .max(1)
+        .checked_next_multiple_of(block_height)?;
     let depth = if desc.dimension == TEXTURE_3D {
-        (u32::from(desc.depth_or_array_size) >> mip).max(1)
+        u32::from(desc.depth_or_array_size).checked_shr(mip)?.max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = (width / block_width).checked_mul(element)?;
     let footprint = PlacedFootprint {
         offset: 0,
-        format: desc.format,
+        format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
+        row_pitch: u32::try_from(row_size.checked_next_multiple_of(pitch_alignment)?).ok()?,
     };
-    Some((footprint, u32::try_from(height / block).ok()?, row_size))
+    Some((
+        footprint,
+        u32::try_from(height / block_height).ok()?,
+        row_size,
+    ))
 }
 
-/// Device method: where each subresource goes in an upload buffer, rows
-/// 256-byte and subresources 512-byte aligned, as on PC. Unknown sizes give
-/// the documented all-ones values.
+/// Places subresources at 512-byte boundaries in an upload buffer.
+/// Row pitch is aligned to 512 bytes for depth/stencil and planar video,
+/// and 256 bytes otherwise. An unknown size gives an all-ones total.
 pub(crate) extern "system" fn copyable_footprints(
     _: This,
     desc: *const ResourceDesc,
@@ -450,16 +494,26 @@ pub(crate) extern "system" fn copyable_footprints(
     const PLACEMENT: u64 = 512;
     // SAFETY: the title passes a description (null is tolerated).
     let desc = unsafe { desc.as_ref() };
-    let mut end = base;
+    // Keep offsets relative to `base`: D3D12 preserves an unaligned base
+    // and aligns the distance to each following subresource.
+    let mut end = 0u64;
     let mut known = desc.is_some();
     for i in 0..count {
-        let one = desc.and_then(|d| subresource(d, first + i));
+        let one = desc
+            .and_then(|d| first.checked_add(i).and_then(|index| subresource(d, index)))
+            .and_then(|(mut footprint, row_count, row_size)| {
+                let start = end.checked_next_multiple_of(PLACEMENT)?;
+                footprint.offset = base.checked_add(start)?;
+                let lines = u64::from(row_count).checked_mul(u64::from(footprint.depth))?;
+                let preceding_rows =
+                    u64::from(footprint.row_pitch).checked_mul(lines.saturating_sub(1))?;
+                let span = preceding_rows.checked_add(row_size)?;
+                let next = start.checked_add(span)?;
+                Some((footprint, row_count, row_size, next))
+            });
         let (layout, row_count, row_size) = match one {
-            Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
-                let pitch = u64::from(footprint.row_pitch);
-                let lines = u64::from(row_count) * u64::from(footprint.depth);
-                end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
+            Some((footprint, row_count, row_size, next)) => {
+                end = next;
                 (footprint, row_count, row_size)
             }
             None => {
@@ -486,7 +540,7 @@ pub(crate) extern "system" fn copyable_footprints(
     }
     if !total.is_null() {
         // SAFETY: checked non-null.
-        unsafe { total.write(if known { end - base } else { u64::MAX }) };
+        unsafe { total.write(if known { end } else { u64::MAX }) };
     }
 }
 
@@ -812,8 +866,7 @@ impl Resource {
                 let clear = clear
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-                let texture = host_texture(&self.desc, state, clear)?;
-                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+                let (texture, state) = host_texture(&self.desc, state, clear)?;
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
@@ -868,13 +921,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags, and the state it was made in
+/// (what the transitions that follow start from).
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -912,8 +966,12 @@ fn host_texture(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). The host takes it only when it names the
+    // resource's own format or, for a depth target, the pair's other one,
+    // so it is passed through as the title gave it and dropped only if
+    // the host refuses the texture with it: that costs the texture's
+    // initial contents, not the texture.
+    let clear_value: Option<[u32; 5]> = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
@@ -927,63 +985,122 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // Not every host GPU offers every use of every format (NVIDIA: no
+    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
+    // console's AMD GPU has both). Try what the title asked for, then give
+    // up the state, the clear value and the uses the host may refuse, in
+    // that order; the views the host cannot make are skipped as for depth.
+    let asked = crate::host::legal_for(d.flags, crate::host::texture_state(state));
+    let tries = attempts(d.flags, asked);
+    let mut tried: Vec<(u32, u32, Option<[u32; 5]>)> = Vec::with_capacity(tries.len());
     let mut texture: Option<ID3D12Resource> = None;
-    let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
+    let mut made_in = None;
+    let mut last = None;
+    for (i, &(flags, wanted, keep_clear)) in tries.iter().enumerate() {
+        let mut trial = d;
+        trial.flags = flags;
+        let initial = crate::host::legal_for(flags, wanted);
         // A clear value is only legal on render targets and depth.
-        let clear = clear_value
-            .as_ref()
-            .filter(|_| d.flags & (1 | DEPTH) != 0)
-            .map(|v| std::ptr::from_ref(v).cast());
+        let try_clear = clear_value.filter(|_| keep_clear && flags & (RENDER_TARGET | DEPTH) != 0);
+        // Permissions that leave the description unchanged are not asked twice.
+        if tried.contains(&(flags, initial, try_clear)) {
+            continue;
+        }
+        tried.push((flags, initial, try_clear));
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
-        unsafe {
+        let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
-                D3D12_RESOURCE_STATES(crate::host::legal_for(
-                    d.flags,
-                    crate::host::texture_state(state),
-                ) as i32),
+                std::ptr::from_ref(&trial).cast(),
+                D3D12_RESOURCE_STATES(initial as i32),
                 // The same layout: format, then color or depth and stencil.
+                try_clear.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                &mut texture,
+            )
+        };
+        match made {
+            Ok(()) => {
+                if i > 0 {
+                    // The host refused what the title asked for: name what
+                    // was given up, once for this texture.
+                    tracing::warn!(
+                        desc = ?d,
+                        flags_asked = d.flags,
+                        flags_made = flags,
+                        state_asked = asked,
+                        state_made = initial,
+                        clear_asked = clear_value.map(|v| v[0]),
+                        clear_dropped = clear_value.is_some() && try_clear.is_none(),
+                        "host texture made only as a fallback"
+                    );
+                }
+                d = trial;
+                made_in = Some(initial);
+                break;
+            }
+            Err(e) => {
+                texture = None;
+                tracing::debug!(
+                    error = %e,
+                    attempt = i,
+                    flags,
+                    state = initial,
+                    "host texture refused; trying a fallback"
+                );
+                last = Some((e, trial, initial, try_clear.map(|v| v[0])));
+            }
+        }
+    }
+    let (Some(texture), Some(initial)) = (texture, made_in) else {
+        if let Some((e, trial, initial, clear)) = last {
+            tracing::warn!(
+                error = %e,
+                desc = ?trial,
+                state = initial,
+                title_state = state,
                 clear,
-                texture,
-            )
+                "no host texture"
+            );
         }
+        return None;
     };
-    let mut made = create(&d, &mut texture);
-    // Not every host GPU offers every use of every format (NVIDIA: no
-    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
-    // console's AMD GPU has both). Give up the uses the host refuses, UAV
-    // first; the views the host cannot make are skipped as for depth.
-    for drop in [UNORDERED, 1] {
-        if made.is_ok() || d.flags & drop == 0 {
-            continue;
+    crate::host::name(&texture, || {
+        format!(
+            "texture {}x{} f{} flags {:#x}",
+            d.width, d.height, d.format, d.flags
+        )
+    });
+    Some((texture, initial))
+}
+
+/// The (flags, state, whether the clear value is kept) triples to try for a
+/// host texture, most faithful first: what the title asked for, then in the
+/// common state, then without the clear value, then without the permissions
+/// the host may refuse. A texture the host cannot make as asked still exists
+/// for the draws that read it; the log names what was lost. Nothing is
+/// tried twice, permissions only go down, and a depth target keeps its
+/// depth permission.
+#[cfg(any(windows, test))]
+fn attempts(flags: u32, state: u32) -> Vec<(u32, u32, bool)> {
+    const UNORDERED: u32 = 4;
+    const RENDER_TARGET: u32 = 1;
+    let mut out: Vec<(u32, u32, bool)> = Vec::with_capacity(7);
+    for triple in [
+        (flags, state, true),
+        (flags, 0, true),
+        (flags, state, false),
+        (flags, 0, false),
+        (flags & !UNORDERED, 0, true),
+        (flags & !UNORDERED, 0, false),
+        (flags & !UNORDERED & !RENDER_TARGET, 0, false),
+    ] {
+        if !out.contains(&triple) {
+            out.push(triple);
         }
-        let mut fewer = d;
-        fewer.flags &= !drop;
-        let mut retry: Option<ID3D12Resource> = None;
-        if create(&fewer, &mut retry).is_ok() {
-            tracing::warn!(desc = ?d, dropped = drop, "host texture without a use the host refuses");
-            d = fewer;
-            texture = retry;
-            made = Ok(());
-        } else if drop == UNORDERED {
-            d = fewer; // also try with neither
-        }
     }
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
-    }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!(
-                "texture {}x{} f{} flags {:#x}",
-                d.width, d.height, d.format, d.flags
-            )
-        });
-    }
-    texture
+    out
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1302,9 +1419,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    // create_at_address can succeed with no host texture (unsupported
+    // format/flags): do not cache that failure, or the next call would
+    // return Some with host == None (VIC-BT-027).
+    if resource(out).host().is_none() {
+        object::release_boxed::<Resource>(out);
+        return None;
+    }
     map.insert((address, *desc), out as usize);
     placed_views().insert(out as usize);
-    resource(out).host().is_some().then_some(out)
+    Some(out)
 }
 
 /// The resources [`texture_at`] made (never released, as they are).
@@ -1620,6 +1744,66 @@ mod tests {
         assert_eq!(family(66), 66);
     }
 
+    /// The ladder of descriptions a host texture is tried in.
+    #[test]
+    fn the_first_attempt_is_what_the_title_asked_for() {
+        assert_eq!(
+            attempts(5, 4),
+            [
+                (5, 4, true),
+                (5, 0, true),
+                (5, 4, false),
+                (5, 0, false),
+                (1, 0, true),
+                (1, 0, false),
+                (0, 0, false),
+            ]
+        );
+        assert_eq!(attempts(3, 0x10)[0], (3, 0x10, true));
+    }
+
+    #[test]
+    fn nothing_is_tried_twice() {
+        assert_eq!(attempts(0, 0), [(0, 0, true), (0, 0, false)]);
+        for flags in 0..16 {
+            for state in [0, 4, 0x10] {
+                let tries = attempts(flags, state);
+                for (i, a) in tries.iter().enumerate() {
+                    assert!(!tries[i + 1..].contains(a), "{flags} {state}: {tries:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_depth_target_keeps_its_depth_permission() {
+        for flags in [2, 3, 6, 7, 10] {
+            assert!(attempts(flags, 0x10).iter().all(|&(f, _, _)| f & 2 != 0));
+        }
+    }
+
+    #[test]
+    fn permissions_only_go_down_the_ladder() {
+        for flags in 0..16 {
+            let tries = attempts(flags, 4);
+            assert!(tries.iter().all(|&(f, _, _)| f & !flags == 0));
+            let mut least = flags;
+            for &(f, _, _) in &tries {
+                assert!(f & !least == 0, "{flags}: {tries:?}");
+                least = f;
+            }
+        }
+    }
+
+    #[test]
+    fn the_state_and_clear_go_before_the_permissions() {
+        let tries = attempts(5, 4);
+        let first_fewer = tries.iter().position(|&(f, _, _)| f != 5).unwrap();
+        assert!(tries[..first_fewer].iter().any(|&(_, s, _)| s == 0));
+        assert!(tries[..first_fewer].iter().any(|&(_, _, clear)| !clear));
+        assert!(tries[first_fewer..].iter().all(|&(_, s, _)| s == 0));
+    }
+
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
     type Address = extern "system" fn(This) -> u64;
@@ -1858,6 +2042,195 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn copyable_footprints_match_native_packed_and_unaligned_cases() {
+        // DXGI 68/69 store pairs of texels in one 32-bit word. An odd mip
+        // width of five therefore occupies three words (six footprint texels).
+        for format in [68, 69] {
+            let desc = texture(10, 6, format, 2);
+            let (mut layout, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT], [0u32], [0u64], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                1,
+                1,
+                0,
+                layout.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                (layout[0].width, layout[0].height),
+                (6, 3),
+                "format {format}"
+            );
+            assert_eq!((rows[0], sizes[0]), (3, 12), "format {format}");
+            assert_eq!(layout[0].row_pitch, 256, "format {format}");
+            assert_eq!(total, 524, "format {format}");
+            let odd_width = PlacedFootprint {
+                width: 5,
+                ..layout[0]
+            };
+            assert_eq!(odd_width.layout(), Some((3, 12, 524)));
+        }
+
+        let desc = texture(10, 6, 28, 2);
+        for base in [0, 1] {
+            let (mut layouts, mut rows, mut sizes, mut total) =
+                ([NO_FOOTPRINT; 2], [0u32; 2], [0u64; 2], 0u64);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                2,
+                base,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(layouts[0].offset, base);
+            assert_eq!(layouts[1].offset, base + 1536);
+            assert_eq!(total, 2068);
+        }
+    }
+
+    #[test]
+    fn planar_video_copy_footprints() {
+        // Native D3D12 reports both Y slices first, then both interleaved UV slices.
+        for (format, y, uv, bytes, pitch) in [(103, 60, 48, 514, 1024), (104, 53, 33, 1028, 1536)] {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                ..texture(514, 258, format, 1)
+            };
+            let mut layouts = [NO_FOOTPRINT; 4];
+            let (mut rows, mut sizes, mut total) = ([0; 4], [0; 4], 0);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                4,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                layouts.map(|l| (l.format, l.width, l.height)),
+                [(y, 514, 258), (y, 514, 258), (uv, 257, 129), (uv, 257, 129)]
+            );
+            assert_eq!(layouts.map(|l| l.row_pitch), [pitch; 4]);
+            assert_eq!(rows, [258, 258, 129, 129]);
+            assert_eq!(sizes, [bytes; 4]);
+            let stride = u64::from(pitch);
+            assert_eq!(
+                layouts.map(|l| l.offset),
+                [0, 258, 516, 645].map(|r| 512 + r * stride)
+            );
+            assert_eq!(total, 773 * stride + bytes);
+            // Starting at UV describes only the requested range in the upload buffer.
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                2,
+                1,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            assert_eq!(
+                (layouts[0].offset, layouts[0].format, rows[0], sizes[0]),
+                (512, uv, 129, bytes)
+            );
+            assert_eq!(total, 128 * stride + bytes);
+            assert!(subresource(&desc, 4).is_none());
+
+            for invalid in [
+                ResourceDesc {
+                    dimension: TEXTURE_3D,
+                    ..desc
+                },
+                ResourceDesc {
+                    mip_levels: 0,
+                    ..desc
+                },
+                ResourceDesc {
+                    mip_levels: 2,
+                    ..desc
+                },
+                ResourceDesc {
+                    sample_count: 4,
+                    ..desc
+                },
+                ResourceDesc { width: 513, ..desc },
+                ResourceDesc {
+                    height: 257,
+                    ..desc
+                },
+                ResourceDesc {
+                    depth_or_array_size: 2049,
+                    ..desc
+                },
+            ] {
+                assert!(subresource(&invalid, 0).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn depth_stencil_footprints_follow_the_pc_plane_order() {
+        // Native D3D12 reports the same layout for both depth/stencil families
+        // and their view formats. Mips vary fastest, then array slices, then planes.
+        let expected = [
+            (512, 39, 16, 8),
+            (4_608, 39, 8, 4),
+            (6_656, 39, 16, 8),
+            (10_752, 39, 8, 4),
+            (12_800, 60, 16, 8),
+            (16_896, 60, 8, 4),
+            (18_944, 60, 16, 8),
+            (23_040, 60, 8, 4),
+        ];
+        for format in (19..=22).chain(44..=47) {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                ..texture(16, 8, format, 2)
+            };
+            let mut layouts = [NO_FOOTPRINT; 8];
+            let (mut rows, mut sizes, mut total) = ([0; 8], [0; 8], 0);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                8,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+
+            assert_eq!(
+                layouts.map(|l| (l.offset, l.format, l.width, l.height)),
+                expected,
+                "format {format}"
+            );
+            assert!(
+                layouts.iter().all(|l| l.depth == 1 && l.row_pitch == 512),
+                "format {format}"
+            );
+            assert_eq!(rows, [8, 4, 8, 4, 8, 4, 8, 4], "format {format}");
+            assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
+            assert_eq!(total, 24_072, "format {format}");
+            assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
     }
 
     /// The title may view a texture as sRGB or linear whichever format it

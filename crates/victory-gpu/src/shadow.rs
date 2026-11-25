@@ -452,6 +452,19 @@ impl Shadow {
     }
 }
 
+/// A refresh that copies none of its range is skipped: the writes it was
+/// asked about were already in the copy, the range is outside the buffer,
+/// or shaders were still writing all of it (that part is left to a later
+/// refresh). Counted for the frame-rate line as one skipped refresh of
+/// `len` bytes, so `0 skipped` there means no refresh was answered
+/// without a copy, not that nothing was checked. A range copied in part is
+/// not skipped; of what it did not copy, `unchanged` counts only the parts
+/// this refresh checked, not the sub-ranges shaders still write.
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) fn skipped(len: usize, copied: usize) -> Option<u64> {
+    (len > 0 && copied == 0).then_some(len as u64)
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -621,6 +634,19 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    /// A refresh that copied nothing of its range is what the frame-rate
+    /// line's `skipped` counts; one that copied any part of it is not, and
+    /// an empty range is neither.
+    #[test]
+    fn a_refresh_that_copies_nothing_is_counted_as_skipped() {
+        assert_eq!(skipped(0, 0), None);
+        assert_eq!(skipped(4 << 20, 0), Some(4 << 20));
+        assert_eq!(skipped(4 << 20, 1), None);
+        assert_eq!(skipped(4 << 20, 4 << 20), None);
+        // Nothing in the buffer: the range was outside it.
+        assert_eq!(skipped(4096, 0), Some(4096));
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
