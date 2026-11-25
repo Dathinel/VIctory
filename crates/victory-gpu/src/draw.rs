@@ -2073,9 +2073,11 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            list.defer_host_read(from as *const u8, n * 3 * stride, move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
+                // recorded), the host read holds `title_memory_reading` over
+                // `[from, from + n * 3 * stride)`, and the scratch memory is
+                // the list's.
                 let (src, dst) = unsafe {
                     (
                         std::slice::from_raw_parts(from as *const u8, n * 3 * stride),

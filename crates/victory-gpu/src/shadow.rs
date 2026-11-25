@@ -362,6 +362,7 @@ impl Shadow {
     }
 
     /// Refresh a range and prepare its host buffer for the specified GPU use.
+    /// Clamped to the copy.
     pub(crate) fn refresh_as(
         self: &Arc<Self>,
         list: &HostList,
@@ -539,8 +540,14 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        let end = self.start.saturating_add(self.len);
+        let from = address.max(self.start);
+        let to = address.saturating_add(len).min(end);
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            return;
+        }
+        list.defer_gpu_write(self, from as usize, len as usize);
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -856,34 +863,29 @@ impl Shadow {
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
-        let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
+        let stale = stale_pages_in(base, &copied, from, to, written);
+        let mut bytes = 0;
+        let mut run: Option<(usize, usize)> = None;
+        for page in stale {
+            // A page only partly in the range is copied in part: it
+            // stays stale for the rest.
+            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                copied[page - base] = now;
+            }
+            match run {
+                Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
+                Some((first, prev)) => {
+                    bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
+                    run = Some((page, page));
                 }
-                _ => 0,
-            };
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                None => run = Some((page, page)),
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        if let Some((first, prev)) = run {
+            bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
         }
         bytes
     }
@@ -927,6 +929,44 @@ impl Shadow {
         }
         len
     }
+}
+
+/// Pages of `[a, e)` that have never been copied (`copied == 0`) or were
+/// written by the title after their last copy (`write > copied`). Matches
+/// [`Shadow::copy_stale`], which copies both cases even when a never-copied
+/// page does not appear in the write-watch delta `written`.
+fn stale_pages_in(
+    base: usize,
+    copied: &[u64],
+    a: usize,
+    e: usize,
+    written: &[(usize, u64)],
+) -> Vec<usize> {
+    if a >= e {
+        return Vec::new();
+    }
+    let mut writes = written.iter().peekable();
+    let mut out = Vec::new();
+    for page in a / PAGE..=(e - 1) / PAGE {
+        while writes.peek().is_some_and(|&&(p, _)| p < page) {
+            writes.next();
+        }
+        let write = match writes.peek() {
+            Some(&&(p, w)) if p == page => {
+                writes.next();
+                w
+            }
+            _ => 0,
+        };
+        if page >= base
+            && copied
+                .get(page - base)
+                .is_none_or(|&at| at == 0 || write > at)
+        {
+            out.push(page);
+        }
+    }
+    out
 }
 
 /// A refresh that copies none of its range is skipped: the writes it was
@@ -1899,5 +1939,28 @@ mod tests {
         }
         drop(first);
         unregister(resource, start);
+    }
+
+    /// Never-copied pages (`copied == 0`) inside a range must still be
+    /// reported as stale even when absent from the write-watch journal,
+    /// and leading entries before the range must not stall the scan.
+    #[test]
+    fn stale_pages_include_uncopied_pages_absent_from_write_watch() {
+        let base = 0x100usize;
+        // Pages 0..4: page 0 copied at t=5, page 1 never copied (0), page 2
+        // copied at t=5, page 3 copied at t=10.
+        let copied = [5u64, 0, 5, 10];
+        let a = base * PAGE;
+        let e = (base + 4) * PAGE;
+        // Write-watch includes a leading out-of-range page plus pages 2 and 3.
+        let written = [(base - 1, 99u64), (base + 2, 7u64), (base + 3, 8u64)];
+        assert_eq!(
+            stale_pages_in(base, &copied, a, e, &written),
+            vec![base + 1, base + 2]
+        );
+        // Even with an empty write-watch delta, uncopied page 1 is still stale.
+        assert_eq!(stale_pages_in(base, &copied, a, e, &[]), vec![base + 1]);
+        // Once all pages are copied and clean, nothing is stale.
+        assert!(stale_pages_in(base, &[10, 10, 10, 10], a, e, &written).is_empty());
     }
 }
