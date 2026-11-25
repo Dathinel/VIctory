@@ -211,7 +211,7 @@ fn check(shader: &HostShader, want: &[u32; LANES]) {
 }
 
 /// Whether `host` can run a wave of 32 lanes.
-fn runs_wave32(host: &Host) -> bool {
+pub(super) fn runs_wave32(host: &Host) -> bool {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
     };
