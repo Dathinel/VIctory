@@ -814,6 +814,15 @@ impl State {
                     &mut heap_values[..]
                 };
                 for u in &t.host.user_data {
+                    if u.indexed_buffer {
+                        let selected =
+                            self.user_value(compute, u.slot, RootType::Constants, u.dword);
+                        let Some(binding) = self.indexed_buffer(list, selected, compute) else {
+                            return false;
+                        };
+                        values[u.index as usize..][..3].copy_from_slice(&binding);
+                        continue;
+                    }
                     let fresh = made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
@@ -915,6 +924,76 @@ impl State {
         true
     }
 
+    fn raw_slot(
+        &mut self,
+        host: &crate::descriptor::host::HostHeap,
+        heap_id: usize,
+        access: RawAccess,
+        view: Option<(&ID3D12Resource, u64, u64)>,
+    ) -> Option<u32> {
+        let range = view.map(|(buffer, offset, len)| RawBufferRange {
+            resource: buffer.as_raw() as usize,
+            offset,
+            len,
+        });
+        // A title address may now resolve to a different buffer. Earlier
+        // commands still reference the old slot, so allocate on a miss.
+        let index = match self.root_view_slots.entry((heap_id, access, range)) {
+            std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let index = host.dynamic(1)?;
+                match (access, view) {
+                    (RawAccess::Read, Some((buffer, offset, len))) => {
+                        host.raw_at(index, buffer, offset, len)
+                    }
+                    (RawAccess::ReadWrite, Some((buffer, offset, len))) => {
+                        host.raw_uav_at(index, buffer, offset, len)
+                    }
+                    (RawAccess::Read, None) => host.null_raw_at(index),
+                    (RawAccess::ReadWrite, None) => host.null_raw_uav_at(index),
+                }
+                self.dynamic.push((heap_id, index, 1));
+                *slot.insert(index)
+            }
+        };
+        Some(index)
+    }
+
+    fn indexed_buffer(
+        &mut self,
+        list: &HostList,
+        selected: u32,
+        compute: bool,
+    ) -> Option<[u32; 3]> {
+        let key = self.heaps[0];
+        if key == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(key as This);
+        let host = heap.host()?;
+        // The console forms this byte offset with a 32-bit shift by five.
+        let Some(read) = heap.selected_buffer(selected & (u32::MAX >> 5)) else {
+            return Some([self.raw_slot(host, key, RawAccess::Read, None)?, 0, 0]);
+        };
+        let offset = read.shadow.offset(read.address);
+        let bias = offset % 16;
+        let index = self.raw_slot(
+            host,
+            key,
+            RawAccess::Read,
+            Some((&read.shadow.buffer, offset - bias, read.bytes + bias)),
+        )?;
+        let state = if compute {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        } else {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        };
+        read.shadow
+            .refresh_as(list, read.address, read.bytes, state);
+        Some([index, read.stride, bias as u32])
+    }
+
     /// Bind a raw view of the remaining host buffer. A writable view, its
     /// initial contents, and its copy-back all cover the same whole dwords.
     fn root_buffer_table(
@@ -961,32 +1040,8 @@ impl State {
         } else {
             None
         };
-        let range = view.map(|(buffer, offset, len)| RawBufferRange {
-            resource: buffer.as_raw() as usize,
-            offset,
-            len,
-        });
-        // A title address may now resolve to a different buffer. Earlier
-        // commands still reference the old slot, so allocate on a miss.
-        let index = match self.root_view_slots.entry((heap_id, access, range)) {
-            std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                let Some(index) = host.dynamic(1) else {
-                    return false;
-                };
-                match (access, view) {
-                    (RawAccess::Read, Some((buffer, offset, len))) => {
-                        host.raw_at(index, buffer, offset, len)
-                    }
-                    (RawAccess::ReadWrite, Some((buffer, offset, len))) => {
-                        host.raw_uav_at(index, buffer, offset, len)
-                    }
-                    (RawAccess::Read, None) => host.null_raw_at(index),
-                    (RawAccess::ReadWrite, None) => host.null_raw_uav_at(index),
-                }
-                self.dynamic.push((heap_id, index, 1));
-                *slot.insert(index)
-            }
+        let Some(index) = self.raw_slot(host, heap_id, access, view) else {
+            return false;
         };
         if let (Some((a, s)), Some((_, _, len))) = (&shadow, view) {
             let wanted = match access {
@@ -4735,6 +4790,164 @@ mod structured_alias_tests {
         fn drop(&mut self) {
             crate::shadow::unregister(self.resource, self.address);
         }
+    }
+
+    #[test]
+    fn root_constant_selects_the_buffer_stride_and_bounded_range_at_dispatch() {
+        use victory_shader::native::{ComputeIo, RootParam, StageIo};
+        use victory_shader::{HwStage, NativeProgram};
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped indexed buffer readback: no D3D12 device");
+            return;
+        };
+        // Select an SRV via s1, read the record in s2 at byte 4 and write it to UAV slot 0.
+        let words = [
+            0xbe84_0300u32,
+            0xbe85_0380, // heap base in s[4:5]
+            0x8f06_8501, // s6 = s1 << 5
+            0xf408_0202,
+            0x0c00_0000, // s[8:11] = selected descriptor
+            0xf408_0302,
+            0xfa00_0000, // s[12:15] = output descriptor
+            0x7e00_0202, // v0 = s2
+            0xe034_2004,
+            0x8002_0100, // buffer_load_dwordx2 v[1:2], v0, s[8:11], idxen offset:4
+            0xe074_0000,
+            0x8003_0100, // buffer_store_dwordx2 v[1:2], off, s[12:15]
+            0xbf81_0000,
+        ];
+        let root = |root, slot| RootParam {
+            root,
+            slot,
+            user_data: slot,
+            sgprs: 1,
+            table_offset_dwords: 0,
+            base_register: 0,
+        };
+        let shader = crate::pipeline::Shader::test_compute(NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                root(RootType::ResourceHeap, 0),
+                root(RootType::Constants, 1),
+                root(RootType::Constants, 2),
+            ],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 4,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        });
+        let pipeline = HostPipeline::new(&[shader], None, &[]).expect("indexed compute pipeline");
+        let mut backing: Vec<u32> = (0..64).map(|i| 0x6200_0000 + i).collect();
+        let base = backing.as_mut_ptr() as u64;
+        crate::shadow::register(base as usize, base, 256);
+        let _shadow = ShadowGuard {
+            resource: base as usize,
+            address: base,
+        };
+        #[repr(C)]
+        struct HeapDesc {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let desc = HeapDesc {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 4,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let mut views = std::ptr::null();
+        let iid = ID3D12DescriptorHeap::IID;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const desc).cast(),
+                (&raw const iid).cast(),
+                &mut views
+            ),
+            crate::object::S_OK
+        );
+        let _views = TitleObject(views);
+        let heap = crate::descriptor::heap(views);
+        let out = host.default_buffer(256).unwrap();
+        heap.host().unwrap().raw_uav_at(0, &out, 0, 256);
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        resource[4] = 256;
+        // The first view starts at byte 12 and has stride 12. The second starts
+        // at byte 32 and has stride 32. The last contains only one record.
+        for (slot, stride, count) in [(1, 12, 2), (2, 32, 2), (3, 16, 1)] {
+            let mut words = [0u32; 16];
+            words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            words[4] = 1; // FirstElement
+            words[6] = count;
+            words[7] = stride;
+            words[10] = base as u32;
+            words[11] = (base >> 32) as u32;
+            crate::descriptor::create_placed_srv(
+                std::ptr::null(),
+                &resource,
+                &words,
+                heap.start + slot * 32,
+            );
+        }
+        let (buffer, mapped) = host.readback_buffer(48).unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[views]);
+        let list = host.new_list().unwrap();
+        // The last two addresses wrap during the multiplication or the offset addition.
+        let cases = [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (99, 1),
+            (2, 0x0800_0001),
+            (1, 0x1555_5555),
+        ];
+        for (i, (selected, record)) in cases.into_iter().enumerate() {
+            state.set_constants(true, 2, &[record], 0);
+            state.set_constants(true, 1, &[selected], 0);
+            assert!(state.bind(&list, &pipeline, true));
+            // SAFETY: the open list has live descriptors and the readback has two dwords per dispatch.
+            unsafe {
+                list.list.Dispatch(1, 1, 1);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list
+                    .CopyBufferRegion(&buffer, 8 * i as u64, &out, 0, 8);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the submission completed, and the mapped buffer holds six pairs of dwords.
+        let got = unsafe { mapped.cast::<[[u32; 2]; 6]>().read_unaligned() };
+        assert_eq!(
+            got,
+            [
+                [backing[7], backing[8]],
+                [backing[17], backing[18]],
+                [0; 2],
+                [0; 2],
+                [0; 2],
+                [0; 2]
+            ]
+        );
+        eprintln!("indexed buffer readback: {got:x?}");
     }
 
     #[test]

@@ -1230,6 +1230,49 @@ fn buffer_srv_parts(view: &View) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW
     }
 }
 
+pub(crate) struct BufferRead {
+    pub(crate) shadow: Arc<crate::shadow::Shadow>,
+    pub(crate) address: u64,
+    pub(crate) bytes: u64,
+    pub(crate) stride: u32,
+}
+
+/// A bounded dword-readable window in the backing buffer. Raw views index
+/// bytes, even though the descriptor expresses its extent in dwords.
+pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
+    let (base, size, desc) = buffer_srv_parts(view)?;
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension selects the Buffer union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let element = element_size(&desc);
+    let stride = if b.Flags == D3D12_BUFFER_SRV_FLAG_RAW {
+        1
+    } else {
+        element.try_into().ok()?
+    };
+    let start = b.FirstElement.checked_mul(element)?;
+    let bytes = u64::from(b.NumElements).checked_mul(element)?;
+    if bytes < 4 || start.checked_add(bytes)? > size {
+        return None;
+    }
+    let shadow = crate::shadow::find(base, size)?;
+    let address = base.checked_add(start)?;
+    let offset = shadow.offset(address);
+    // Reserve the last 16-byte block as an out-of-bounds address even for
+    // four-dword reads. Include the prefix required by raw SRV alignment.
+    if !offset.is_multiple_of(4) || bytes + offset % 16 > u64::from(u32::MAX - 15) {
+        return None;
+    }
+    Some(BufferRead {
+        shadow,
+        address,
+        bytes,
+        stride,
+    })
+}
+
 /// Re-expresses the exact byte start and length of a raw buffer SRV as
 /// structured elements of width `stride`, rejecting typed or already-structured
 /// views and fractional bounds.

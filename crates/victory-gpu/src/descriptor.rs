@@ -129,6 +129,39 @@ impl Heap {
             .as_ref()
     }
 
+    /// Resolve the buffer view selected by a shader root constant.
+    #[cfg(windows)]
+    pub(crate) fn selected_buffer(&self, index: u32) -> Option<host::BufferRead> {
+        if self.desc.kind != VIEWS_KIND || index >= self.desc.count {
+            return None;
+        }
+        let at = self.start.checked_add(u64::from(index) * 32)?;
+        let mut record = [0u32; 3];
+        crate::host::copy_mapped(
+            record.as_mut_ptr().cast(),
+            at as *const u8,
+            size_of_val(&record),
+            false,
+        );
+        let [tag, index, generation] = record;
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let (view, current) = views.list.get(index as usize)?;
+        if tag != VIEW_TAG || *current != generation {
+            return None;
+        }
+        let pinned = if let View::Shader(resource, _) = view {
+            // SAFETY: a resource's destructor must acquire VIEWS before freeing it.
+            Some(unsafe { crate::object::Held::try_new(*resource as This) }?)
+        } else {
+            None
+        };
+        let view = view.clone();
+        drop(views);
+        let read = host::selected_buffer(&view);
+        drop(pinned);
+        read
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);

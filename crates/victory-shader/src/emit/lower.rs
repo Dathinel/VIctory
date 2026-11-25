@@ -1476,12 +1476,17 @@ impl<'a> Lower<'a> {
         self.user_reads.insert(
             index,
             UserData {
+                indexed_buffer: false,
                 index,
                 slot: rp.slot,
                 root: rp.root,
                 dword,
             },
         );
+        Val::I32(self.user_word(index))
+    }
+
+    fn user_word(&mut self, index: u32) -> V {
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1501,7 +1506,7 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -4348,6 +4353,78 @@ impl<'a> Lower<'a> {
         let mut strides = src.leaves().into_iter().map(stride);
         let first = strides.next().flatten()?;
         strides.all(|other| other == Some(first)).then_some(first)
+    }
+
+    /// A fixed root-constant dword used as a view index: heap base plus
+    /// that value shifted left by five (32 bytes per descriptor).
+    fn buffer_selector(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first: 0 } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        if self.x.native.layout.get(a.param)?.root != RootType::ResourceHeap || a.offset != 0 {
+            return None;
+        }
+        let value = a.dynamic?;
+        let block = &self.x.p.blocks[*self.def_block.get(&value)?];
+        let shift = block
+            .insts
+            .iter()
+            .find(|i| i.writes.first().is_some_and(|w| w.1 == value))?;
+        let Fields::Sop { src, .. } = &shift.fields else {
+            return None;
+        };
+        let [Operand::Scalar { code, .. }, Operand::Const(133)] = src.as_slice() else {
+            return None;
+        };
+        if shift.name() != "s_lshl_b32" {
+            return None;
+        }
+        let &(param, dword) = self.params.get(&shift.read(Reg::S(*code))?)?;
+        let root = self.x.native.layout[param];
+        (root.root == RootType::Constants).then_some((root.slot, dword))
+    }
+
+    fn selected_buffer(&mut self, slot: u8, dword: u32) -> Result<[V; 3], Why> {
+        let existing = self
+            .user_reads
+            .values()
+            .find(|u| u.indexed_buffer && u.slot == slot && u.dword == dword);
+        let index = if let Some(u) = existing {
+            u.index
+        } else {
+            // Inputs that are used later must retain their original positions.
+            let inputs = self
+                .params
+                .values()
+                .filter_map(|&(p, word)| {
+                    let rp = self.x.native.layout[p];
+                    matches!(rp.root, RootType::Constants | RootType::Table)
+                        .then_some(u32::from(rp.user_data) + word + 1)
+                })
+                .max()
+                .unwrap_or(0);
+            let index = inputs.max(self.s.user_data);
+            if index + 3 > 64 {
+                return Err("an indexed buffer beyond the root constant budget");
+            }
+            self.user_reads.insert(
+                index,
+                UserData {
+                    indexed_buffer: true,
+                    index,
+                    slot,
+                    root: RootType::Constants,
+                    dword,
+                },
+            );
+            index
+        };
+        Ok([
+            self.user_word(index),
+            self.user_word(index + 1),
+            self.user_word(index + 2),
+        ])
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -7817,8 +7894,40 @@ impl<'a> Lower<'a> {
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
-            match index {
-                Some(index) => {
+            let selector = (!uav && used.is_none())
+                .then(|| self.buffer_selector(src))
+                .flatten();
+            match (index, selector) {
+                (Some(index), Some((slot, word))) => {
+                    let [alias, stride, bias] = self.selected_buffer(slot, word)?;
+                    let start = self.s.m.bin(c, Bin::Mul, index, stride);
+                    let offset = self.s.m.bin(c, Bin::Add, start, off);
+                    let byte = self.s.m.bin(c, Bin::Add, offset, bias);
+                    // A wrapped byte offset must stay outside the bounded raw view.
+                    let high = self.mul_hi(index, stride, false);
+                    let zero = self.s.m.i32(0);
+                    let product_wrapped = self.s.m.cmp(c, pred::NE, high, zero);
+                    let offset_wrapped = self.s.m.cmp(c, pred::IULT, offset, start);
+                    let bias_wrapped = self.s.m.cmp(c, pred::IULT, byte, offset);
+                    let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
+                    let overflow = self.s.m.bin(c, Bin::Or, wrapped, bias_wrapped);
+                    // The host leaves this final block outside every alias. All
+                    // four component addresses still fit in a 32-bit offset.
+                    let invalid = self.s.m.i32(u32::MAX - 15);
+                    let in_last_block = self.s.m.cmp(c, pred::IUGE, byte, invalid);
+                    let invalid_address = self.s.m.bin(c, Bin::Or, overflow, in_last_block);
+                    let byte = self.s.m.select(c, invalid_address, invalid, byte);
+                    let h = self.s.heap_handle(c, alias, false, false, (11, 0));
+                    self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, byte, iu, mask, align],
+                    )
+                }
+                (Some(index), None) => {
                     let stride = self.structured_stride(src, uav)?;
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     self.s.op(
@@ -7830,7 +7939,7 @@ impl<'a> Lower<'a> {
                         &[h, index, off, mask, align],
                     )
                 }
-                None => {
+                (None, _) => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
                     self.s.op(
                         c,
