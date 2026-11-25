@@ -566,8 +566,9 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
-    /// Upload memory for data the list's draws make (expanded vertices),
-    /// reused after a reset.
+    /// Upload memory for data the list's draws make (expanded vertices): keeps
+    /// at most one warm chunk across resets and drops all chunks when parked in
+    /// the pool.
     scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
@@ -602,7 +603,8 @@ pub(crate) struct HostList {
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// GPU-writable scratch for indirect rectangle expansion (`rectangles`):
     /// expanded vertices, rewritten draw arguments and per-draw atomic
-    /// counters, reused across draws and across resets.
+    /// counters, keeping at most one warm counter chunk across resets and
+    /// releasing all buffers when parked in the pool.
     rect_scratch: Mutex<RectScratch>,
     /// Active retirement epoch pinned while this list has recorded work or is
     /// queued/executing (0 when idle).
@@ -923,10 +925,10 @@ impl Host {
     }
 
     /// Returns a finished, unreferenced host list to the pool up to
-    /// [`LIST_POOL_CAP`], releasing any kept upload blocks and dynamic slots
-    /// immediately.
+    /// [`LIST_POOL_CAP`], releasing all retained uploads, tracked resources,
+    /// scratch buffers, and retirement pins immediately.
     pub(crate) fn recycle_list(&self, list: HostList) {
-        list.release_kept();
+        list.release_for_pool();
         let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
         if pool.len() < LIST_POOL_CAP {
             pool.push(list);
@@ -1631,9 +1633,9 @@ impl HostList {
         }
     }
 
-    /// Only after the list's last submission finished (every one is waited
-    /// for).
-    pub(crate) fn reset(&self) {
+    /// Clears per-recording tracking state shared between [`Self::reset`] and
+    /// [`Self::release_for_pool`].
+    fn clear_tracking(&self) {
         self.release_kept();
         self.shadow_states
             .lock()
@@ -1655,12 +1657,43 @@ impl HostList {
             .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Releases all retained memory and retirement pins before parking an idle,
+    /// finished list in `Host::free_lists`. D3D12 allocator/list resets still
+    /// run in [`Self::reset`] when [`Host::acquire_list`] pops it for reuse.
+    fn release_for_pool(&self) {
+        self.clear_tracking();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            scratch.chunks.clear();
             (scratch.current, scratch.used) = (0, 0);
         }
         {
             let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            rect.vertices = None;
+            rect.args = None;
+            rect.counters.clear();
+            (rect.counter_chunk, rect.counter_used) = (0, 0);
+        }
+        self.release_epoch();
+    }
+
+    /// Only after the list's last submission finished (every one is waited
+    /// for).
+    pub(crate) fn reset(&self) {
+        self.clear_tracking();
+        {
+            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep at most one warm 4 MiB upload chunk so steady-state active
+            // lists avoid re-allocating while multi-chunk spikes are freed.
+            scratch.chunks.truncate(1);
+            (scratch.current, scratch.used) = (0, 0);
+        }
+        {
+            let mut rect = self.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep at most one warm rect counter chunk across resets.
+            rect.counters.truncate(1);
             (rect.counter_chunk, rect.counter_used) = (0, 0);
         }
         // SAFETY: the list is not executing.
@@ -3985,6 +4018,287 @@ mod tests {
         let release =
             crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(tex, 0x10);
         assert_eq!(release(tex), 0);
+    }
+
+    #[test]
+    fn host_list_reset_trims_excess_scratch_chunks() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+
+        // Allocate 3 x 3 MiB so 3 distinct 4 MiB scratch chunks are created.
+        for _ in 0..3 {
+            let (gpu, ptr) = list.scratch(3 << 20).expect("scratch allocation");
+            assert_ne!(gpu, 0);
+            assert!(!ptr.is_null());
+        }
+        assert!(
+            list.scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chunks
+                .len()
+                >= 2,
+            "multi-chunk scratch spike should allocate at least two chunks"
+        );
+
+        // Also spill past one rect counter chunk to verify counter truncation.
+        for _ in 0..=RECT_COUNTER_CHUNK {
+            assert!(list.rect_counter().is_some());
+        }
+        assert_eq!(
+            list.rect_scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .counters
+                .len(),
+            2
+        );
+
+        let errors_before = host.d3d12_errors();
+        list.close();
+        list.reset();
+
+        {
+            let scratch = list.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                scratch.chunks.len(),
+                1,
+                "reset should keep at most one warm scratch chunk"
+            );
+            assert_eq!((scratch.current, scratch.used), (0, 0));
+        }
+        {
+            let rect = list.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                rect.counters.len(),
+                1,
+                "reset should keep at most one warm rect counter chunk"
+            );
+            assert_eq!((rect.counter_chunk, rect.counter_used), (0, 0));
+        }
+
+        // Subsequent allocations reuse the warm chunks and execute cleanly.
+        let (gpu, ptr) = list.scratch(4096).expect("warm scratch allocation");
+        assert_ne!(gpu, 0);
+        assert!(!ptr.is_null());
+        assert_eq!(
+            list.scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chunks
+                .len(),
+            1
+        );
+        assert!(list.rect_counter().is_some());
+        assert_eq!(
+            list.rect_scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .counters
+                .len(),
+            1
+        );
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn recycle_list_releases_scratch_uploads_and_tracked_resources_immediately() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let list_raw = list.list.as_raw() as usize;
+
+        // Track a title texture on the list, then release the title object so
+        // only the list's tracked state and epoch keep HostTexture alive.
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        list.transition(tex, SHADER_RESOURCE);
+        let weak_tex = std::sync::Arc::downgrade(
+            &crate::resource::host_copy(tex).expect("tracked host texture"),
+        );
+        let release =
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
+        assert!(weak_tex.upgrade().is_some());
+
+        // Populate scratch chunks, uploads, kept objects, shadow states,
+        // rect scratch, deferred work, pipelines, and a pinned retirement epoch.
+        assert!(list.scratch(3 << 20).is_some());
+        assert!(list.scratch(3 << 20).is_some());
+        let (upload_res, _) = list.upload(host, 4096).expect("list upload");
+        list.keep(&upload_res);
+        drop(upload_res);
+        let shadow_buf = host.default_buffer(256).expect("shadow buffer");
+        list.use_shadow(&shadow_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        drop(shadow_buf);
+        assert!(list.rect_vertices(4096).is_some());
+        assert!(list.rect_args(4096).is_some());
+        assert!(list.rect_counter().is_some());
+        list.used_pipeline("recycle_test_pipeline");
+        let (deferred_counter, deferred_drops) = DropCounter::new();
+        list.defer_host(move || {
+            let _ = &deferred_counter;
+        });
+        let (retired_counter, retired_drops) = DropCounter::new();
+        retire(retired_counter);
+        assert!(list.has_epoch());
+        assert_eq!(retired_drops.load(Ordering::SeqCst), 0);
+
+        let errors_before = host.d3d12_errors();
+        list.close();
+        host.execute(&[&list]);
+
+        assert!(weak_tex.upgrade().is_some());
+        assert_eq!(deferred_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(retired_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            list.scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chunks
+                .len(),
+            2
+        );
+
+        // Ensure room in free_lists so recycling parks the list rather than dropping it.
+        {
+            let mut pool = host.free_lists.lock().unwrap_or_else(|e| e.into_inner());
+            if pool.len() >= LIST_POOL_CAP {
+                pool.pop();
+            }
+        }
+        let reused_before = host.reused_lists();
+        host.recycle_list(list);
+
+        assert!(
+            weak_tex.upgrade().is_none(),
+            "tracked HostTexture must drop immediately when list is recycled"
+        );
+        assert_eq!(
+            deferred_drops.load(Ordering::SeqCst),
+            1,
+            "deferred closures must drop immediately when list is recycled"
+        );
+        assert_eq!(
+            retired_drops.load(Ordering::SeqCst),
+            1,
+            "list epoch must release immediately when list is recycled"
+        );
+
+        {
+            let pool = host.free_lists.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pooled) = pool.iter().find(|l| l.list.as_raw() as usize == list_raw) {
+                assert!(
+                    pooled
+                        .scratch
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .chunks
+                        .is_empty(),
+                    "pooled list must hold 0 scratch chunks"
+                );
+                let rect = pooled
+                    .rect_scratch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                assert!(rect.vertices.is_none());
+                assert!(rect.args.is_none());
+                assert!(rect.counters.is_empty());
+                assert_eq!((rect.counter_chunk, rect.counter_used), (0, 0));
+                assert!(
+                    pooled
+                        .states
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                );
+                assert!(
+                    pooled
+                        .shadow_states
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                );
+                assert!(
+                    pooled
+                        .dirty_resources
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                );
+                assert!(
+                    pooled
+                        .pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                );
+                assert_eq!(pooled.state_gen(), 0);
+                assert!(!pooled.has_epoch());
+                let deferred = pooled.deferred();
+                assert!(deferred.uploads.is_empty());
+                assert!(deferred.kept.is_empty());
+                assert!(deferred.copies.is_empty());
+            } else {
+                assert!(
+                    host.reused_lists() > reused_before,
+                    "recycled list should sit in free_lists unless popped concurrently"
+                );
+            }
+        }
+
+        // Pop from the pool and verify D3D12 reset + recording + execution
+        // succeed cleanly with zero debug-layer errors.
+        let reused = host.acquire_list().expect("acquire recycled list");
+        let (gpu, ptr) = reused.scratch(4096).expect("scratch after pool reuse");
+        assert_ne!(gpu, 0);
+        assert!(!ptr.is_null());
+        assert!(reused.rect_vertices(4096).is_some());
+        assert!(reused.rect_args(4096).is_some());
+        assert!(reused.rect_counter().is_some());
+        reused.close();
+        host.execute(&[&reused]);
+        assert_eq!(host.d3d12_errors(), errors_before);
     }
 }
 
