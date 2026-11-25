@@ -9243,13 +9243,7 @@ mod tests {
     fn ds_swizzle_b32_zeros_inactive_source_lanes() {
         // s_mov_b32 exec_lo, 0x5555 (odd lanes inactive); ds_swizzle_b32 v1, v0
         // offset:0x41f (and:0x1f or:0 xor:1 — exchange with the neighbour).
-        let words = [
-            0xBEFE_03FF,
-            0x0000_5555,
-            0xD8D4_041F,
-            0x0100_0000,
-            S_ENDPGM,
-        ];
+        let words = [0xBEFE_03FF, 0x0000_5555, 0xD8D4_041F, 0x0100_0000, S_ENDPGM];
         let lowered = lower_words(&words, 0).expect("ds_swizzle_b32 lowers");
         assert!(
             lowered.has_wave_active_ballot,
