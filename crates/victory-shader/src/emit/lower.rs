@@ -56,6 +56,9 @@ pub(crate) struct Lowered {
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    /// Whether a pixel helper lane's `v_readfirstlane` selects its own value.
+    #[cfg(test)]
+    pub has_helper_lane_op: bool,
     /// Test builds: the `dx.op` calls before optimization, see
     /// [`Module::dx_op_calls`].
     #[cfg(test)]
@@ -1263,6 +1266,8 @@ impl<'a> Lower<'a> {
         #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
         #[cfg(test)]
+        let has_helper_lane_op = self.s.m.has_dx_op("dx.op.isHelperLane.i1", 221);
+        #[cfg(test)]
         let dx_ops = self.s.m.dx_op_calls();
         Ok(Lowered {
             #[cfg(test)]
@@ -1302,6 +1307,8 @@ impl<'a> Lower<'a> {
             has_fcmp_oeq,
             #[cfg(test)]
             has_coverage_op,
+            #[cfg(test)]
+            has_helper_lane_op,
             #[cfg(test)]
             dx_ops,
         })
@@ -2905,6 +2912,30 @@ impl<'a> Lower<'a> {
             r = self.s.m.select(c, is, read, r);
         }
         r
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane: draws of 0.3 to 1.3 s
+    /// each, then DEVICE_HUNG. With its own value a helper lane matches in
+    /// the first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -6295,6 +6326,7 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {

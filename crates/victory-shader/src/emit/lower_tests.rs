@@ -415,8 +415,8 @@ fn f16_fma_and_mad_mac_lower() {
     lowers(&mac, 0).expect("v_mac_f16");
 }
 
-/// Lowers a pixel program with one target: whether it translates.
-fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+/// Lowers a pixel program with one target.
+fn lower_ps_words(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Ps,
@@ -460,7 +460,34 @@ fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
         prims: vec![],
         mesh_stride: 0,
     })
-    .map(|_| ())
+}
+
+/// Lowers a pixel program with one target: whether it translates.
+fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+    lower_ps_words(words).map(|_| ())
+}
+
+/// A bare `v_readfirstlane_b32` in a pixel shader (not a proved waterfall
+/// descriptor read) wraps `waveReadLaneFirst` so a helper lane keeps its
+/// own value: `select(isHelperLane(), own, first)`. Compute is unchanged.
+#[test]
+fn pixel_readfirstlane_helper_lane_keeps_own_value() {
+    // v_readfirstlane_b32 s0, v0; v_mov_b32 v0, s0; exp mrt0 …; s_endpgm
+    let words = [0x7E00_0500, 0x7E00_0200, 0xF800_180F, 0, S_ENDPGM];
+    let ps = lower_ps_words(&words).expect("pixel readfirstlane");
+    assert!(ps.wave_ops);
+    assert!(
+        ps.has_helper_lane_op,
+        "pixel v_readfirstlane must emit dx.op.isHelperLane.i1"
+    );
+
+    // Same code as compute: no helpers, so no isHelperLane wrap.
+    let cs = lower_words(&words, 0).expect("compute readfirstlane");
+    assert!(cs.wave_ops);
+    assert!(
+        !cs.has_helper_lane_op,
+        "compute v_readfirstlane must stay bare waveReadLaneFirst"
+    );
 }
 
 /// Lowers a compute program of constants that allocates 512 bytes of LDS
