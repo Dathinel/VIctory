@@ -2067,6 +2067,229 @@ fn bcpack_index_residual_sum_matches_the_formats_function() {
     });
 }
 
+/// `victory_formats::bcpack::nibbles`, the function the test below runs as console code.
+fn nibbles_reference(b: u8, odd_first: bool) -> [i16; 2] {
+    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
+    let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+    let (even, odd) = (z(half(b)), z(half(b >> 1)));
+    if odd_first { [odd, even] } else { [even, odd] }
+}
+
+fn nibbles_body() -> Vec<u32> {
+    let vcc = sgpr(106);
+    // v1 = the byte, v2 = whether the odd bits come first. v5 and v6 gather the even and
+    // the odd bits.
+    let mut body = vec![vop1(0x001, 5, 128), vop1(0x001, 6, 128)]; // v_mov_b32 v5, 0; v6, 0
+    for k in 0u16..4 {
+        for (half, bit) in [(5, 2 * k), (6, 2 * k + 1)] {
+            body.extend(vop3(0x148, 7, vgpr(1), 128 + bit, 129)); // v_bfe_u32 v7, v1, bit, 1
+            body.extend(vop3(0x36F, half, vgpr(7), 128 + k, vgpr(half))); // v_lshl_or_b32
+        }
+    }
+    // Zigzag to signed, kept as 16 bits: v8 from the even half, v11 from the odd one.
+    for (half, out) in [(5, 8), (6, 11)] {
+        body.extend(vop3(0x116, 9, 129, vgpr(half), 128)); // v_lshrrev_b32 v9, 1, half
+        body.extend(vop3(0x148, 10, vgpr(half), 128, 129)); // v_bfe_u32 v10, half, 0, 1
+        body.extend(vop3(0x126, 10, 128, vgpr(10), 128)); // v_sub_nc_u32 v10, 0, v10
+        body.extend(vop3(0x11D, out, vgpr(9), vgpr(10), 128)); // v_xor_b32 out, v9, v10
+        body.extend(vop3(0x148, out, vgpr(out), 128, 128 + 16)); // v_bfe_u32 out, out, 0, 16
+    }
+    // The pair in the order asked for, the second in the result's high half.
+    body.extend(vop3(0x0C5, 106, 128, vgpr(2), 128)); // v_cmp_ne_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 14, vgpr(8), vgpr(11), vcc)); // v_cndmask_b32 v14, v8, v11, vcc
+    body.extend(vop3(0x101, 15, vgpr(11), vgpr(8), vcc)); // v_cndmask_b32 v15, v11, v8, vcc
+    body.extend(vop3(0x36F, 0, vgpr(15), 128 + 16, vgpr(14))); // v_lshl_or_b32 v0, v15, 16, v14
+    body
+}
+
+/// BCPack's split of a byte into two signed nibbles, written as console code, matches the
+/// formats crate's function on the GPU for every byte in both orders.
+#[test]
+fn bcpack_nibble_split_matches_the_formats_function() {
+    let shader = build_valu_cs(&nibbles_body());
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for odd_first in [false, true] {
+        for b in 0u32..256 {
+            cases.push([b, u32::from(odd_first), 0, 0]);
+            let [first, second] = nibbles_reference(b as u8, odd_first);
+            want.push(u32::from(second as u16) << 16 | u32::from(first as u16));
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: nibbles{inputs:?}");
+    });
+}
+
+/// `victory_formats::bcpack::bc7_precision` with its table and `pbits`, the function the
+/// test below runs as console code.
+fn bc7_precision_reference(ctrl: u16) -> [u8; 4] {
+    const BC7_BITS: [[u8; 4]; 8] = [
+        [4, 4, 4, 0],
+        [6, 6, 6, 0],
+        [5, 5, 5, 0],
+        [7, 7, 7, 0],
+        [5, 5, 5, 6],
+        [7, 7, 7, 8],
+        [7, 7, 7, 7],
+        [5, 5, 5, 5],
+    ];
+    fn pbits(mode: u16) -> bool {
+        matches!(mode, 0 | 1 | 3 | 6 | 7)
+    }
+    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let mut p = BC7_BITS[usize::from(mode)];
+    if rot != 0 {
+        p.swap(3, rot - 1);
+    } else if pbits(mode) {
+        p[0] += 1;
+    }
+    p
+}
+
+fn bc7_precision_body() -> Vec<u32> {
+    let vcc = sgpr(106);
+    // The table's rows as little-endian dwords, and the modes with a p-bit as a bit set.
+    const ROWS: [u32; 8] = [
+        0x0004_0404,
+        0x0006_0606,
+        0x0005_0505,
+        0x0007_0707,
+        0x0605_0505,
+        0x0807_0707,
+        0x0707_0707,
+        0x0505_0505,
+    ];
+    let mut body = Vec::new();
+    // v1 = the control word; v2 = its mode, v3 = its rotation, v5 = the mode's row.
+    body.extend(vop3(0x148, 2, vgpr(1), 128, 128 + 3)); // v_bfe_u32 v2, v1, 0, 3
+    body.extend(vop3(0x148, 3, vgpr(1), 128 + 3, 128 + 2)); // v_bfe_u32 v3, v1, 3, 2
+    body.extend([vop1(0x001, 5, 255), ROWS[0]]); // v_mov_b32 v5, row 0
+    for (mode, row) in ROWS.iter().enumerate().skip(1) {
+        body.extend([vop1(0x001, 6, 255), *row]); // v_mov_b32 v6, row
+        body.extend(vop3(0x0C2, 106, 128 + mode as u16, vgpr(2), 128)); // v_cmp_eq_u32 vcc, mode, v2
+        body.extend(vop3(0x101, 5, vgpr(5), vgpr(6), vcc)); // v_cndmask_b32 v5, v5, v6, vcc
+    }
+    // No rotation: red gains the p-bit. v7 = the row with it.
+    body.extend([vop1(0x001, 7, 255), 0b1100_1011]); // v_mov_b32 v7, modes 0, 1, 3, 6, 7
+    body.extend(vop3(0x116, 7, vgpr(2), vgpr(7), 128)); // v_lshrrev_b32 v7, v2, v7
+    body.extend(vop3(0x148, 7, vgpr(7), 128, 129)); // v_bfe_u32 v7, v7, 0, 1
+    body.extend(vop3(0x125, 7, vgpr(5), vgpr(7), 128)); // v_add_nc_u32 v7, v5, v7
+    // A rotation swaps alpha with channel `rot - 1`: v8 = that channel's shift, v9 = the
+    // two bytes' difference, v10 = the row with them exchanged.
+    body.extend(vop3(0x125, 8, 193, vgpr(3), 128)); // v_add_nc_u32 v8, -1, v3
+    body.extend(vop3(0x11A, 8, 128 + 3, vgpr(8), 128)); // v_lshlrev_b32 v8, 3, v8
+    body.extend(vop3(0x116, 9, vgpr(8), vgpr(5), 128)); // v_lshrrev_b32 v9, v8, v5
+    body.extend(vop3(0x148, 9, vgpr(9), 128, 128 + 8)); // v_bfe_u32 v9, v9, 0, 8
+    body.extend(vop3(0x148, 10, vgpr(5), 128 + 24, 128 + 8)); // v_bfe_u32 v10, v5, 24, 8
+    body.extend(vop3(0x11D, 9, vgpr(9), vgpr(10), 128)); // v_xor_b32 v9, v9, v10
+    body.extend(vop3(0x11A, 10, vgpr(8), vgpr(9), 128)); // v_lshlrev_b32 v10, v8, v9
+    body.extend(vop3(0x11D, 10, vgpr(5), vgpr(10), 128)); // v_xor_b32 v10, v5, v10
+    body.extend(vop3(0x11A, 9, 128 + 24, vgpr(9), 128)); // v_lshlrev_b32 v9, 24, v9
+    body.extend(vop3(0x11D, 10, vgpr(10), vgpr(9), 128)); // v_xor_b32 v10, v10, v9
+    body.extend(vop3(0x0C5, 106, 128, vgpr(3), 128)); // v_cmp_ne_u32 vcc, 0, v3
+    body.extend(vop3(0x101, 0, vgpr(7), vgpr(10), vcc)); // v_cndmask_b32 v0, v7, v10, vcc
+    body
+}
+
+/// BC7's channel precisions for a control word, written as console code, match the
+/// formats crate's function on the GPU for every mode and rotation.
+#[test]
+fn bcpack_bc7_precisions_match_the_formats_function() {
+    let shader = build_valu_cs(&bc7_precision_body());
+    // Every mode and rotation, alone and under each of the control word's higher bits.
+    let cases: Vec<[u32; 4]> = (0u32..32)
+        .flat_map(|low| [0u32, 0x20, 0x8000, 0xFFE0].map(|high| [high | low, 0, 0, 0]))
+        .collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = u32::from_le_bytes(bc7_precision_reference(inputs[0] as u16));
+        assert_eq!(got, want, "{backend}: bc7_precision({:#x})", inputs[0]);
+    });
+}
+
+/// `victory_formats::bcpack::pick` with its history length, the function the test below
+/// runs as console code.
+fn pick_reference<'a, T>(
+    i: usize,
+    r: usize,
+    history: &'a [T],
+    dictionary: &'a [T],
+    zero: &'a T,
+) -> &'a T {
+    const HISTORY: usize = 256;
+    match r {
+        0 => zero,
+        r if r <= i => &history[(i - r) % HISTORY],
+        r => &dictionary[r - i - 1],
+    }
+}
+
+/// BCPack's choice of a block's reference, written as console code, matches the formats
+/// crate's function on the GPU: none, a block of the history ring, or a dictionary entry
+/// before the first block, on both sides of each boundary.
+#[test]
+fn bcpack_reference_choice_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the block, v2 = its reference. The result names the source in its high half
+    // (1 the history, 2 the dictionary) and the entry in its low half.
+    body.extend(vop3(0x126, 5, vgpr(1), vgpr(2), 128)); // v_sub_nc_u32 v5, v1, v2
+    body.extend(vop3(0x148, 5, vgpr(5), 128, 128 + 8)); // v_bfe_u32 v5, v5, 0, 8
+    body.extend(vop3(0x36F, 5, 129, 128 + 16, vgpr(5))); // v_lshl_or_b32 v5, 1, 16, v5
+    body.extend(vop3(0x126, 6, vgpr(2), vgpr(1), 128)); // v_sub_nc_u32 v6, v2, v1
+    body.extend(vop3(0x125, 6, 193, vgpr(6), 128)); // v_add_nc_u32 v6, -1, v6
+    body.extend(vop3(0x36F, 6, 130, 128 + 16, vgpr(6))); // v_lshl_or_b32 v6, 2, 16, v6
+    body.extend(vop3(0x0C3, 106, vgpr(2), vgpr(1), 128)); // v_cmp_le_u32 vcc, v2, v1
+    body.extend(vop3(0x101, 7, vgpr(6), vgpr(5), vcc)); // v_cndmask_b32 v7, v6, v5, vcc
+    body.extend(vop3(0x0C2, 106, 128, vgpr(2), 128)); // v_cmp_eq_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 0, vgpr(7), 128, vcc)); // v_cndmask_b32 v0, v7, 0, vcc
+    let shader = build_valu_cs(&body);
+    // Entries that say where they are, so the function's choice reads as the result does.
+    let history: Vec<u32> = (0..256).map(|k| 1 << 16 | k).collect();
+    let dictionary: Vec<u32> = (0..255).map(|k| 2 << 16 | k).collect();
+    // Blocks and references on both sides of `r == 0`, `r == i` and the ring's length.
+    let cases: Vec<[u32; 4]> = [0u32, 1, 2, 254, 255, 256, 1000]
+        .into_iter()
+        .flat_map(|i| [0u32, 1, 2, 3, 128, 254, 255].map(|r| [i, r, 0, 0]))
+        .collect();
+    run_cases(&shader, &cases, |backend, _, [i, r, ..], got| {
+        let want = *pick_reference(i as usize, r as usize, &history, &dictionary, &0);
+        assert_eq!(got, want, "{backend}: pick(block {i}, reference {r})");
+    });
+}
+
+/// `victory_formats::bcpack::bc6_index_bits`, the function the test below runs as console
+/// code.
+fn bc6_index_bits_reference(mode: u8) -> u8 {
+    match mode {
+        1..=10 => 3,
+        11..=14 => 4,
+        _ => 0,
+    }
+}
+
+/// BC6H's index width for a mode, written as console code, matches the formats crate's
+/// function on the GPU for every byte.
+#[test]
+fn bcpack_bc6_index_width_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the mode. Two range tests as unsigned compares of the mode less the range's start.
+    body.extend(vop3(0x125, 5, 193, vgpr(1), 128)); // v_add_nc_u32 v5, -1, v1
+    body.extend(vop3(0x0C4, 106, 128 + 10, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 10, v5
+    body.extend(vop3(0x101, 6, 128, 128 + 3, vcc)); // v_cndmask_b32 v6, 0, 3, vcc
+    body.extend(vop3(0x126, 5, vgpr(1), 128 + 11, 128)); // v_sub_nc_u32 v5, v1, 11
+    body.extend(vop3(0x0C4, 106, 128 + 4, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 4, v5
+    body.extend(vop3(0x101, 7, 128, 128 + 4, vcc)); // v_cndmask_b32 v7, 0, 4, vcc
+    body.extend(vop3(0x11C, 0, vgpr(6), vgpr(7), 128)); // v_or_b32 v0, v6, v7
+    let shader = build_valu_cs(&body);
+    let cases: Vec<[u32; 4]> = (0u32..256).map(|mode| [mode, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = u32::from(bc6_index_bits_reference(inputs[0] as u8));
+        assert_eq!(got, want, "{backend}: bc6_index_bits({})", inputs[0]);
+    });
+}
+
 /// `victory_formats::bcpack::quads`, the function the test below runs as console code.
 fn quads_reference(rank: &[u8; 256], s: &[u8], ix: &mut [u8]) {
     for (q, &sym) in s.iter().enumerate() {
