@@ -1999,35 +1999,71 @@ fn bcpack_zigzag_decode_matches_the_formats_function() {
     });
 }
 
-/// `victory_formats::bcpack::bc6_index_bits`, the function the test below runs as console
-/// code.
-fn bc6_index_bits_reference(mode: u8) -> u8 {
-    match mode {
-        1..=10 => 3,
-        11..=14 => 4,
-        _ => 0,
-    }
+/// `victory_formats::bcpack::add_index`, the function the test below runs as console code.
+fn add_index_reference(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
+    let up = |v: i16, b: u8| {
+        if b == 0 || b > 16 {
+            0
+        } else {
+            (v as u16) << (16 - b)
+        }
+    };
+    let sum = up(cur, bits).wrapping_add(up(refv, ref_bits)) as i16;
+    if bits == 0 { 0 } else { sum >> (16 - bits) }
 }
 
-/// BC6H's index width for a mode, written as console code, matches the formats crate's
-/// function on the GPU for every byte.
-#[test]
-fn bcpack_bc6_index_width_matches_the_formats_function() {
+fn add_index_body() -> Vec<u32> {
     let vcc = sgpr(106);
     let mut body = Vec::new();
-    // v1 = the mode. Two range tests as unsigned compares of the mode less the range's start.
-    body.extend(vop3(0x125, 5, 193, vgpr(1), 128)); // v_add_nc_u32 v5, -1, v1
-    body.extend(vop3(0x0C4, 106, 128 + 10, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 10, v5
-    body.extend(vop3(0x101, 6, 128, 128 + 3, vcc)); // v_cndmask_b32 v6, 0, 3, vcc
-    body.extend(vop3(0x126, 5, vgpr(1), 128 + 11, 128)); // v_sub_nc_u32 v5, v1, 11
-    body.extend(vop3(0x0C4, 106, 128 + 4, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 4, v5
-    body.extend(vop3(0x101, 7, 128, 128 + 4, vcc)); // v_cndmask_b32 v7, 0, 4, vcc
-    body.extend(vop3(0x11C, 0, vgpr(6), vgpr(7), 128)); // v_or_b32 v0, v6, v7
-    let shader = build_valu_cs(&body);
-    let cases: Vec<[u32; 4]> = (0u32..256).map(|mode| [mode, 0, 0, 0]).collect();
-    run_cases(&shader, &cases, |backend, _, inputs, got| {
-        let want = u32::from(bc6_index_bits_reference(inputs[0] as u8));
-        assert_eq!(got, want, "{backend}: bc6_index_bits({})", inputs[0]);
+    // v1 = cur, v2 = bits, v3 = refv, v4 = ref_bits. v6 = cur left-aligned to 16 bits.
+    body.extend(vop3(0x126, 5, 128 + 16, vgpr(2), 128)); // v_sub_nc_u32 v5, 16, v2
+    body.extend(vop3(0x11A, 6, vgpr(5), vgpr(1), 128)); // v_lshlrev_b32 v6, v5, v1
+    body.extend(vop3(0x148, 6, vgpr(6), 128, 128 + 16)); // v_bfe_u32 v6, v6, 0, 16
+    body.extend(vop3(0x125, 7, 193, vgpr(2), 128)); // v_add_nc_u32 v7, -1, v2
+    body.extend(vop3(0x0C4, 106, 128 + 16, vgpr(7), 128)); // v_cmp_gt_u32 vcc, 16, v7
+    body.extend(vop3(0x101, 6, 128, vgpr(6), vcc)); // v_cndmask_b32 v6, 0, v6, vcc
+    // v9 = refv left-aligned the same way.
+    body.extend(vop3(0x126, 8, 128 + 16, vgpr(4), 128));
+    body.extend(vop3(0x11A, 9, vgpr(8), vgpr(3), 128));
+    body.extend(vop3(0x148, 9, vgpr(9), 128, 128 + 16));
+    body.extend(vop3(0x125, 10, 193, vgpr(4), 128));
+    body.extend(vop3(0x0C4, 106, 128 + 16, vgpr(10), 128));
+    body.extend(vop3(0x101, 9, 128, vgpr(9), vcc));
+    // The 16-bit sum, signed, back down to `bits` bits; nothing at a width of 0.
+    body.extend(vop3(0x125, 11, vgpr(6), vgpr(9), 128)); // v_add_nc_u32 v11, v6, v9
+    body.extend(vop3(0x149, 11, vgpr(11), 128, 128 + 16)); // v_bfe_i32 v11, v11, 0, 16
+    body.extend(vop3(0x118, 0, vgpr(5), vgpr(11), 128)); // v_ashrrev_i32 v0, v5, v11
+    body.extend(vop3(0x0C2, 106, 128, vgpr(2), 128)); // v_cmp_eq_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 0, vgpr(0), 128, vcc)); // v_cndmask_b32 v0, v0, 0, vcc
+    body
+}
+
+/// BCPack's index residual plus its reference, written as console code, matches the formats
+/// crate's function on the GPU at every width, reference widths out of range included.
+#[test]
+fn bcpack_index_residual_sum_matches_the_formats_function() {
+    let shader = build_valu_cs(&add_index_body());
+    let values: [i16; 6] = [0, 1, -1, 0x7FFF, -0x8000, -0x1235];
+    let refs: [i16; 3] = [0, 0x2A5, -7];
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for bits in 0u8..=16 {
+        for ref_bits in [0u8, 1, 4, 8, 15, 16, 17] {
+            for cur in values {
+                for refv in refs {
+                    cases.push([
+                        cur as i32 as u32,
+                        u32::from(bits),
+                        refv as i32 as u32,
+                        u32::from(ref_bits),
+                    ]);
+                    want.push(add_index_reference(cur, bits, refv, ref_bits) as i32 as u32);
+                }
+            }
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: add_index{inputs:?}");
     });
 }
 
@@ -2111,4 +2147,84 @@ fn bcpack_quad_residuals_match_the_formats_function() {
     for (backend, seen) in read {
         assert!(seen.iter().all(|&s| s), "{backend}: cells never read");
     }
+}
+
+/// `victory_formats::bcpack::pairs`, the function the test below runs as console code.
+fn pairs_reference(rank: &[u8; 64], s: &[u8], ix: &mut [u8]) {
+    for (k, &sym) in s.iter().enumerate() {
+        let v = rank[usize::from(sym & 63)];
+        ix[2 * k] = v & 7;
+        ix[2 * k + 1] = v >> 4 & 7;
+    }
+}
+
+/// BCPack's 3-bit index residuals, one symbol per two pixels, written as console code,
+/// match the formats crate's function on the GPU: a rank table that tells the two pixels
+/// apart, read through every symbol, the symbols' two unused bits included.
+#[test]
+fn bcpack_pixel_pair_residuals_match_the_formats_function() {
+    // No entry gives its two pixels the same residual, and the pair is never symmetric.
+    let rank: [u8; 64] = std::array::from_fn(|i| ((i % 8) | (((i * 3 + 1) % 8) << 4)) as u8);
+    assert!(rank.iter().all(|v| v & 7 != v >> 4 & 7));
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the symbol; v2 = its table index, v3 = the index's dword, v5 = that dword.
+    body.extend(vop3(0x148, 2, vgpr(1), 128, 128 + 6)); // v_bfe_u32 v2, v1, 0, 6
+    body.extend(vop3(0x116, 3, 128 + 2, vgpr(2), 128)); // v_lshrrev_b32 v3, 2, v2
+    for (d, row) in rank.as_chunks::<4>().0.iter().enumerate() {
+        let reg = if d == 0 { 5 } else { 6 };
+        body.extend([vop1(0x001, reg, 255), u32::from_le_bytes(*row)]); // v_mov_b32 reg, row
+        if d != 0 {
+            body.extend(vop3(0x0C2, 106, 128 + d as u16, vgpr(3), 128)); // v_cmp_eq_u32 vcc, d, v3
+            body.extend(vop3(0x101, 5, vgpr(5), vgpr(6), vcc)); // v_cndmask_b32 v5, v5, v6, vcc
+        }
+    }
+    // The entry's byte, then its two residuals, the second pixel's in the next byte.
+    body.extend(vop3(0x148, 7, vgpr(2), 128, 128 + 2)); // v_bfe_u32 v7, v2, 0, 2
+    body.extend(vop3(0x11A, 7, 128 + 3, vgpr(7), 128)); // v_lshlrev_b32 v7, 3, v7
+    body.extend(vop3(0x116, 8, vgpr(7), vgpr(5), 128)); // v_lshrrev_b32 v8, v7, v5
+    body.extend(vop3(0x148, 9, vgpr(8), 128, 128 + 3)); // v_bfe_u32 v9, v8, 0, 3
+    body.extend(vop3(0x148, 10, vgpr(8), 128 + 4, 128 + 3)); // v_bfe_u32 v10, v8, 4, 3
+    body.extend(vop3(0x36F, 0, vgpr(10), 128 + 8, vgpr(9))); // v_lshl_or_b32 v0, v10, 8, v9
+    let shader = build_valu_cs(&body);
+    let symbols: Vec<u8> = (0..=255).collect();
+    let mut ix = vec![0u8; 2 * symbols.len()];
+    pairs_reference(&rank, &symbols, &mut ix);
+    let cases: Vec<[u32; 4]> = symbols.iter().map(|&s| [u32::from(s), 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, k, inputs, got| {
+        let want = u32::from(ix[2 * k]) | u32::from(ix[2 * k + 1]) << 8;
+        assert_eq!(got, want, "{backend}: pairs, symbol {}", inputs[0]);
+    });
+}
+
+/// `victory_formats::bcpack::bc6_index_bits`, the function the test below runs as console
+/// code.
+fn bc6_index_bits_reference(mode: u8) -> u8 {
+    match mode {
+        1..=10 => 3,
+        11..=14 => 4,
+        _ => 0,
+    }
+}
+
+/// BC6H's index width for a mode, written as console code, matches the formats crate's
+/// function on the GPU for every byte.
+#[test]
+fn bcpack_bc6_index_width_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the mode. Two range tests as unsigned compares of the mode less the range's start.
+    body.extend(vop3(0x125, 5, 193, vgpr(1), 128)); // v_add_nc_u32 v5, -1, v1
+    body.extend(vop3(0x0C4, 106, 128 + 10, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 10, v5
+    body.extend(vop3(0x101, 6, 128, 128 + 3, vcc)); // v_cndmask_b32 v6, 0, 3, vcc
+    body.extend(vop3(0x126, 5, vgpr(1), 128 + 11, 128)); // v_sub_nc_u32 v5, v1, 11
+    body.extend(vop3(0x0C4, 106, 128 + 4, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 4, v5
+    body.extend(vop3(0x101, 7, 128, 128 + 4, vcc)); // v_cndmask_b32 v7, 0, 4, vcc
+    body.extend(vop3(0x11C, 0, vgpr(6), vgpr(7), 128)); // v_or_b32 v0, v6, v7
+    let shader = build_valu_cs(&body);
+    let cases: Vec<[u32; 4]> = (0u32..256).map(|mode| [mode, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = u32::from(bc6_index_bits_reference(inputs[0] as u8));
+        assert_eq!(got, want, "{backend}: bc6_index_bits({})", inputs[0]);
+    });
 }
