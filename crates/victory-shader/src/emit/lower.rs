@@ -31,6 +31,13 @@ mod lower_memory;
 
 type Why = &'static str;
 
+/// What an indexed buffer access addresses with its index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexedStride {
+    Raw,
+    Structured(u32),
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -56,6 +63,15 @@ pub(crate) struct Lowered {
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    /// Whether a pixel helper lane's `v_readfirstlane` selects its own value.
+    #[cfg(test)]
+    pub has_helper_lane_op: bool,
+    /// Whether the program ballots active lanes (`waveActiveBallot`).
+    #[cfg(test)]
+    pub has_wave_ballot: bool,
+    /// Whether the program emits `dx.op.discard` (pixel survival).
+    #[cfg(test)]
+    pub has_discard_op: bool,
     /// Test builds: the `dx.op` calls before optimization, see
     /// [`Module::dx_op_calls`].
     #[cfg(test)]
@@ -304,6 +320,14 @@ struct Lower<'a> {
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
+    /// Per IR block: a `vm` export is behind every lane entering it.
+    vm_exported: Vec<bool>,
+    /// Per-lane Valid Mask SSA value while lowering a pixel block.
+    vm_live: Option<V>,
+    /// Phi of `vm_live` at the start of multi-predecessor pixel blocks.
+    vm_live_phis: Vec<Option<V>>,
+    /// `vm_live` leaving each IR block (pixel shaders).
+    vm_live_out: Vec<Option<V>>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
@@ -829,6 +853,10 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
+            vm_exported: vec![false; p.blocks.len()],
+            vm_live: None,
+            vm_live_phis: vec![None; p.blocks.len()],
+            vm_live_out: vec![None; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
@@ -1334,6 +1362,18 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+            self.vm_exported[b] =
+                !preds.is_empty() && preds.iter().all(|&q| self.vm_exported_out(q));
+            if self.s.pixel {
+                self.vm_live = Some(if preds.is_empty() {
+                    // Alive until the first Valid-Mask export.
+                    self.s.m.bool(true)
+                } else {
+                    let phi = self.s.m.phi(self.cur, self.s.t.i1);
+                    self.vm_live_phis[b] = Some(phi);
+                    phi
+                });
+            }
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
@@ -1370,6 +1410,9 @@ impl<'a> Lower<'a> {
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
+            if self.s.pixel {
+                self.vm_live_out[b] = self.vm_live;
+            }
             self.exit(b)?;
         }
         self.fill_phis()?;
@@ -1388,6 +1431,12 @@ impl<'a> Lower<'a> {
         let has_fcmp_oeq = self.s.m.has_cmp(pred::OEQ);
         #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
+        #[cfg(test)]
+        let has_helper_lane_op = self.s.m.has_dx_op("dx.op.isHelperLane.i1", 221);
+        #[cfg(test)]
+        let has_wave_ballot = self.s.m.has_dx_op("dx.op.waveActiveBallot", 116);
+        #[cfg(test)]
+        let has_discard_op = self.s.m.has_dx_op("dx.op.discard", 82);
         #[cfg(test)]
         let dx_ops = self.s.m.dx_op_calls();
         Ok(Lowered {
@@ -1428,6 +1477,12 @@ impl<'a> Lower<'a> {
             has_fcmp_oeq,
             #[cfg(test)]
             has_coverage_op,
+            #[cfg(test)]
+            has_helper_lane_op,
+            #[cfg(test)]
+            has_wave_ballot,
+            #[cfg(test)]
+            has_discard_op,
             #[cfg(test)]
             dx_ops,
         })
@@ -1508,6 +1563,14 @@ impl<'a> Lower<'a> {
     fn has_done_export(&self, b: usize) -> bool {
         (0..self.x.p.blocks[b].insts.len())
             .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+    }
+
+    fn vm_exported_out(&self, b: usize) -> bool {
+        self.vm_exported[b] || self.has_vm_export(b)
+    }
+
+    fn has_vm_export(&self, b: usize) -> bool {
+        (0..self.x.p.blocks[b].insts.len()).any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.vm))
     }
 
     /// Values of the program's input registers.
@@ -3101,6 +3164,30 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane: draws of 0.3 to 1.3 s
+    /// each, then DEVICE_HUNG. With its own value a helper lane matches in
+    /// the first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -3110,6 +3197,44 @@ impl<'a> Lower<'a> {
             117,
             &[x, lane],
         )
+    }
+
+    /// `value` when console lane `lane` is in EXEC, else 0. Cross-lane reads
+    /// such as `ds_swizzle_b32` return 0 from an inactive source lane rather
+    /// than the stale VGPR `waveReadLaneAt` would see.
+    fn active_lane_or_zero(&mut self, value: V, lane: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let yes = self.s.m.bool(true);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        self.s.flags |= flags::WAVE_OPS;
+        let (k5, k31, one, z) = (
+            self.s.m.i32(5),
+            self.s.m.i32(31),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let words = match self.s.wave_size {
+            Some(32) => 1,
+            Some(64) => 2,
+            _ => 4,
+        };
+        let word_idx = self.s.m.bin(c, Bin::LShr, lane, k5);
+        let mut word = self.s.m.extract(c, ballot, 0);
+        for j in 1..words {
+            let kj = self.s.m.i32(j);
+            let wj = self.s.m.extract(c, ballot, j);
+            let is = self.s.m.cmp(c, pred::EQ, word_idx, kj);
+            word = self.s.m.select(c, is, wj, word);
+        }
+        let sh = self.s.m.bin(c, Bin::And, lane, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        let on = self.s.m.cmp(c, pred::NE, bit, z);
+        self.s.m.select(c, on, value, z)
     }
 
     /// Coarse derivatives of `coords` across this lane's quad, as DXIL
@@ -3231,6 +3356,8 @@ impl<'a> Lower<'a> {
             } else {
                 self.read_lane(x, src)
             };
+            // Inactive source lanes return 0, not the stale VGPR.
+            let r = self.active_lane_or_zero(r, src);
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -4554,7 +4681,7 @@ impl<'a> Lower<'a> {
                                     .get(&(at, false))
                                     .is_some_and(|src| !self.buffer_loads_only(src)));
                         let stride = if *idxen && format.is_none() {
-                            Some(self.buffer_stride(&src, uav)?)
+                            self.indexed_buffer_stride(&src, uav)?
                         } else {
                             self.table_buffer_stride(&src, used, uav)
                         };
@@ -5413,16 +5540,41 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    fn buffer_stride(&self, src: &Source, uav: bool) -> Result<u32, Why> {
+    /// How an indexed (`idxen`) access addresses the buffer. A stride the
+    /// console metadata declares is used as given. Failing that, the bound
+    /// view decides: a stride of exactly zero is a flat byte buffer, which
+    /// is a raw access (the index contributes `index * 0`), not a structured
+    /// buffer of unknown stride.
+    fn indexed_stride(&self, src: &Source, uav: bool) -> Result<IndexedStride, Why> {
         if let Some(stride) = self
             .used_kind(src)
             .map(|u| u.stride)
             .filter(Self::valid_buffer_stride)
         {
-            return Ok(stride);
+            return Ok(IndexedStride::Structured(stride));
         }
-        self.bound_structured_stride(src, uav, true)
-            .ok_or(UNKNOWN_STRUCTURED_STRIDE)
+        match self.bound_view_stride(src, uav, true) {
+            Some(0) => Ok(IndexedStride::Raw),
+            Some(stride) => Ok(IndexedStride::Structured(stride)),
+            None => Err(UNKNOWN_STRUCTURED_STRIDE),
+        }
+    }
+
+    /// The structured view of an indexed access: its index and stride, or
+    /// `None` when the bound view is raw and the index drops out.
+    fn structured_index(&self, src: &Source, uav: bool, index: V) -> Result<Option<(V, u32)>, Why> {
+        Ok(match self.indexed_stride(src, uav)? {
+            IndexedStride::Raw => None,
+            IndexedStride::Structured(stride) => Some((index, stride)),
+        })
+    }
+
+    /// The stride of an indexed access, `None` for a raw (zero-stride) view.
+    fn indexed_buffer_stride(&self, src: &Source, uav: bool) -> Result<Option<u32>, Why> {
+        Ok(match self.indexed_stride(src, uav)? {
+            IndexedStride::Raw => None,
+            IndexedStride::Structured(stride) => Some(stride),
+        })
     }
 
     fn valid_buffer_stride(stride: &u32) -> bool {
@@ -5430,6 +5582,13 @@ impl<'a> Lower<'a> {
     }
 
     fn bound_structured_stride(&self, src: &Source, uav: bool, required: bool) -> Option<u32> {
+        self.bound_view_stride(src, uav, required)
+            .filter(|&stride| stride != 0)
+    }
+
+    /// The stride every possible view of `src` supplies: 0 for raw, else a
+    /// valid structured stride.
+    fn bound_view_stride(&self, src: &Source, uav: bool, required: bool) -> Option<u32> {
         let view_stride = self.view_stride?;
         let stride = |source: &Source| {
             // shortcut: a descriptor selected by a dynamic index has no
@@ -5451,7 +5610,7 @@ impl<'a> Lower<'a> {
                 },
                 required,
             )
-            .filter(Self::valid_buffer_stride)
+            .filter(|stride| *stride == 0 || Self::valid_buffer_stride(stride))
         };
         // A selected handle has one DXIL annotation. Every possible view must
         // supply the same stride for that instruction.
@@ -5863,8 +6022,43 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Whether lane `src` is active in the current EXEC (via `waveActiveBallot`).
+    fn src_lane_active(&mut self, src: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let t = self.s.m.bool(true);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+        self.s.flags |= flags::WAVE_OPS;
+        let lo = self.s.m.extract(c, ballot, 0);
+        let (k31, k32, one, z) = (
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let word = if self.wave() > 32 {
+            let hi = self.s.m.extract(c, ballot, 1);
+            let low = self.s.m.cmp(c, pred::IULT, src, k32);
+            self.s.m.select(c, low, lo, hi)
+        } else {
+            lo
+        };
+        let sh = self.s.m.bin(c, Bin::And, src, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        self.s.m.cmp(c, pred::NE, bit, z)
+    }
+
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
+    ///
+    /// When `fi` is clear, an inactive source lane is out of bounds the same
+    /// way a row-bound miss is: `bound_ctrl` selects zero, else the lane
+    /// keeps its old destination. DPP8 has no `bound_ctrl` bit and always
+    /// zeros inactive sources when `fi` is clear.
     fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -5875,9 +6069,15 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        let fi = match dpp {
+            Dpp::Lanes { fi, .. } | Dpp::Row { fi, .. } => fi,
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
+        } else if !fi {
+            // Inactive-source checks need a wave ballot; mesh cannot.
+            self.cross_lane(false)?;
         }
         let c = self.cur;
         let lane = self.lane_index();
@@ -5885,7 +6085,8 @@ impl<'a> Lower<'a> {
         let (sixteen_mask, low) = (k(self, !15), k(self, 15));
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
-        // Source lane, and whether it lies in the row.
+        // Source lane, whether it lies in the row, and bound_ctrl (zero on
+        // miss). DPP8 always zeros inactive sources when `fi` is clear.
         let (src, inside, masks, zero) = match dpp {
             Dpp::Lanes { sel, .. } => {
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
@@ -5895,7 +6096,7 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, true)
             }
             Dpp::Row {
                 ctrl,
@@ -5959,8 +6160,17 @@ impl<'a> Lower<'a> {
         } else {
             self.read_lane(x, src)
         };
+        // Geometric bounds, and source EXEC when fetch-inactive is clear.
+        let mut valid = inside;
+        if !fi {
+            let active = self.src_lane_active(src);
+            valid = Some(match valid {
+                Some(v) => self.s.m.bin(c, Bin::And, v, active),
+                None => active,
+            });
+        }
         let mut enable = None;
-        if let Some(inside) = inside {
+        if let Some(inside) = valid {
             if zero {
                 let z = k(self, 0);
                 r = self.s.m.select(c, inside, r, z);
@@ -6542,6 +6752,7 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -9247,11 +9458,13 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let stride = if index.is_some() {
-                Some(self.buffer_stride(src, uav)?)
-            } else {
-                flat_stride
+            // A zero-stride view is raw: the index drops out.
+            let indexed = match index {
+                Some(index) => self.structured_index(src, uav, index)?,
+                None => None,
             };
+            let stride = indexed.map_or(flat_stride, |(_, stride)| Some(stride));
+            let index = indexed.map(|(index, _)| index);
             let h = self.handle(site, src, false, Self::buffer_props(stride, uav))?;
             let (index, off) = match (index, stride) {
                 (Some(index), _) => (index, off),
@@ -9345,9 +9558,12 @@ impl<'a> Lower<'a> {
                 }
                 (69, "bufferStore.f32")
             } else {
-                match index {
-                    Some(index) => {
-                        let stride = self.buffer_stride(src, uav)?;
+                let indexed = match index {
+                    Some(index) => self.structured_index(src, uav, index)?,
+                    None => None,
+                };
+                match indexed {
+                    Some((index, stride)) => {
                         args.push(self.handle(
                             site,
                             src,
@@ -9485,18 +9701,33 @@ impl<'a> Lower<'a> {
                         &[h, byte, iu, mask, align],
                     )
                 }
-                (Some(index), None) => {
-                    let stride = self.buffer_stride(src, uav)?;
-                    let h = self.handle(site, src, false, Self::buffer_props(Some(stride), uav))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
-                }
+                (Some(index), None) => match self.structured_index(src, uav, index)? {
+                    Some((index, stride)) => {
+                        let h =
+                            self.handle(site, src, false, Self::buffer_props(Some(stride), uav))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    }
+                    // Zero-stride view: index * 0 drops out, so this is a raw
+                    // byte load at `off` (#462).
+                    None => {
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, off, iu, mask, align],
+                        )
+                    }
+                },
                 (None, _) => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
                     self.s.op(
@@ -9748,17 +9979,15 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
-        let c = self.cur;
-        if let Some(g) = guard
-            && !mesh
-        {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        // Pixel survival is the EXEC of the last `vm` export (not `done`).
+        if self.s.pixel && e.vm {
+            self.vm_live = Some(match guard {
+                Some(g) => g,
+                None => self.s.m.bool(true),
+            });
+        }
+        if guard.is_some() && !mesh && !self.s.pixel {
+            return Err("a conditional export");
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
@@ -9792,6 +10021,7 @@ impl<'a> Lower<'a> {
         }
         // A mesh lane writes its own vertex or primitive, where it exports;
         // guard against threads past the declared vertex/primitive maximum.
+        // Pixel colour / depth / stencil writes are last-write-masked by EXEC.
         let at = if mesh {
             let m = self.s.mesh.expect("mesh");
             let threads = self.s.threads.expect("mesh")[0];
@@ -9811,6 +10041,8 @@ impl<'a> Lower<'a> {
             } else {
                 guard
             };
+            self.begin_guarded(guard)
+        } else if self.s.pixel {
             self.begin_guarded(guard)
         } else {
             None
@@ -10039,11 +10271,26 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
-                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
-                    // A lane leaving without its final export was killed.
-                    let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                if self.s.pixel {
+                    // Last `vm` export's EXEC is the survival mask; paths that
+                    // never hit a Valid-Mask or `done` export were killed.
+                    if self.vm_exported[b] || self.has_vm_export(b) {
+                        let live = self.vm_live.expect("pixel vm_live");
+                        let t = self.s.m.bool(true);
+                        let kill = self.s.m.bin(self.cur, Bin::Xor, live, t);
+                        self.s.op(
+                            self.cur,
+                            "discard",
+                            Attr::NoUnwind,
+                            self.s.t.void,
+                            82,
+                            &[kill],
+                        );
+                    } else if !self.exported[b] && !self.has_done_export(b) {
+                        let t = self.s.m.bool(true);
+                        self.s
+                            .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                    }
                 }
                 Term::Ret
             }
@@ -10191,6 +10438,21 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        for (b, phi) in self.vm_live_phis.iter().enumerate() {
+            let Some(&phi) = phi.as_ref() else {
+                continue;
+            };
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let Some(qb) = self.tail[q] else {
+                    continue;
+                };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let live = self.vm_live_out[q].unwrap_or_else(|| self.s.m.bool(true));
+                incoming.push((live, qb));
+            }
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
