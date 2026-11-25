@@ -380,7 +380,11 @@ fn create() -> windows::core::Result<Host> {
                     chosen = Some(desc);
                 }
                 Err(e) if filter.is_some() => return Err(e),
-                Err(_) => {
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "hardware adapter selection failed; trying the system default adapter"
+                    );
                     D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
                 }
             }
@@ -3584,17 +3588,21 @@ fn adapter_matches(name: &str, filter: &str) -> bool {
         .contains(&filter.trim().to_ascii_lowercase())
 }
 
-/// Picks a D3D12-capable adapter, preferring the high-performance GPU on
-/// dual-GPU systems so integrated graphics are not chosen over a discrete GPU.
-/// When `filter` is given (`VICTORY_ADAPTER`), requires a case-insensitive
-/// substring match on the adapter description.
+/// Picks the adapter that runs the title: the first, in high-performance order (so a
+/// hybrid laptop's discrete GPU comes before its integrated one), with shader model 6.6,
+/// resource binding tier 3 and mesh shaders; when none has all three, the one that runs
+/// most of the title, with a warning naming what each adapter lacks (`crate::adapter`).
+/// When `filter` is given (`VICTORY_ADAPTER`), only adapters whose description contains
+/// it (case-insensitively) take part, software ones included.
 fn pick_hardware_adapter(
     filter: Option<&str>,
 ) -> windows::core::Result<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
-    // SAFETY: plain DXGI enumeration and D3D12 capability probe.
+    // SAFETY: plain DXGI enumeration and D3D12 capability probes.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
         let factory6 = factory.cast::<IDXGIFactory6>().ok();
+        let mut found: Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> = Vec::new();
+        let mut candidates: Vec<crate::adapter::Candidate> = Vec::new();
         let mut i = 0u32;
         loop {
             let adapter: IDXGIAdapter1 = match &factory6 {
@@ -3613,25 +3621,82 @@ fn pick_hardware_adapter(
             };
             i += 1;
             let desc = adapter.GetDesc1()?;
+            let name = adapter_name(&desc.Description);
             let is_sw = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
             if let Some(needle) = filter {
-                if !adapter_matches(&adapter_name(&desc.Description), needle) {
+                if !adapter_matches(&name, needle) {
                     continue;
                 }
             } else if is_sw {
                 continue;
             }
-            if D3D12CreateDevice(
-                &adapter,
-                D3D_FEATURE_LEVEL_12_0,
-                std::ptr::null_mut::<Option<ID3D12Device>>(),
-            )
-            .is_ok()
-            {
-                return Ok((adapter, desc));
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                tracing::info!(adapter = %name, "adapter skipped: no D3D12 feature level 12_0");
+                continue;
             }
+            let Some(device) = device else { continue };
+            let caps = adapter_caps(&device);
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(adapter = %name, ?caps, "adapter candidate");
+            candidates.push(crate::adapter::Candidate { name, caps });
+            found.push((adapter, desc));
         }
-        Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND))
+        let Some(choice) = crate::adapter::choose(&candidates) else {
+            return Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND));
+        };
+        if let Some(s) = crate::adapter::shortfall(&candidates, &choice) {
+            tracing::warn!(
+                adapter = %s.chosen,
+                lacks = %s.lacks,
+                adapters = %s.adapters,
+                "no adapter has everything the title needs; using the one that runs most"
+            );
+        }
+        Ok(found.swap_remove(choice.index))
+    }
+}
+
+/// What `device` offers of the capabilities the title needs.
+fn adapter_caps(device: &ID3D12Device) -> crate::adapter::Caps {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let mut options7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: each query writes its own structure of the given size; a failed query leaves
+    // the defaults, which read as "not supported".
+    let (options_ok, options7_ok, model_ok) = unsafe {
+        (
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok(),
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options7).cast(),
+                    size_of_val(&options7) as u32,
+                )
+                .is_ok(),
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut model).cast(),
+                    size_of_val(&model) as u32,
+                )
+                .is_ok(),
+        )
+    };
+    crate::adapter::Caps {
+        shader_model_6_6: model_ok && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0,
+        binding_tier_3: options_ok
+            && options.ResourceBindingTier.0 >= D3D12_RESOURCE_BINDING_TIER_3.0,
+        mesh_shaders: options7_ok
+            && options7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
     }
 }
 

@@ -19,6 +19,7 @@
 // their tests), and the paths that feed the host go unused.
 #![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
 
+mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;

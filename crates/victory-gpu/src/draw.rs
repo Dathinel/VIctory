@@ -607,6 +607,22 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
+    fn bound_pipeline(&self, compute: bool) -> Option<std::sync::Arc<HostPipeline>> {
+        crate::pipeline::host::bound_pipeline(self.pipeline as This, |binding| {
+            let Root::Table(base) = *self.roots_ref(compute).get(usize::from(binding.slot))? else {
+                return None;
+            };
+            let handle = base.checked_add(u64::from(binding.offset_dwords) * 4)?;
+            let heap = self.heap_of(base)?;
+            if heap.samplers() {
+                return None;
+            }
+            heap.index(handle)?;
+            let view = crate::descriptor::view(handle)?;
+            crate::descriptor::host::structured_stride(&view, binding.uav)
+        })
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -619,7 +635,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.bound_pipeline(false) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -633,7 +649,7 @@ impl State {
             once!("a rectangle pipeline drawn with another topology");
             return false;
         }
-        if !self.bind(list, p, false) {
+        if !self.bind(list, &p, false) {
             return false;
         }
         let l = &list.list;
@@ -763,7 +779,13 @@ impl State {
                     pixel_hash.and_then(|ps| fullscreen_structured_alias(&stage.shader.hash, ps))
                 })
                 .flatten();
-            let made = self.tables(list, &t.used, compute, alias.as_slice());
+            let made = self.tables_with_strides(
+                list,
+                &t.used,
+                compute,
+                alias.as_slice(),
+                &p.structured_strides,
+            );
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1167,7 +1189,7 @@ impl State {
             self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, false);
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.bound_pipeline(true) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -1190,7 +1212,7 @@ impl State {
             );
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, &p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1256,7 +1278,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.bound_pipeline(compute) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -1353,12 +1375,24 @@ impl State {
     /// command list. Later title descriptor writes cannot change what a
     /// recorded draw samples. Constants also get 256-byte-aligned storage,
     /// filled at submission. Identical descriptors share slots within a list.
+    #[cfg(test)]
     fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         compute: bool,
         aliases: &[StructuredBinding],
+    ) -> Vec<(u8, u32)> {
+        self.tables_with_strides(list, used, compute, aliases, &[])
+    }
+
+    fn tables_with_strides(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+        aliases: &[StructuredBinding],
+        structured_strides: &[(victory_shader::emit::StructuredBinding, u32)],
     ) -> Vec<(u8, u32)> {
         let read_only_depth = self.read_only_depth(compute);
         let tables = |u: &&UsedResource| u.root == RootType::Table;
@@ -1368,6 +1402,7 @@ impl State {
             .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
             .map(|u| u.slot)
             .chain(aliases.iter().map(|a| a.slot))
+            .chain(structured_strides.iter().map(|(binding, _)| binding.slot))
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
@@ -1410,10 +1445,16 @@ impl State {
                 .collect();
             let table_aliases: Vec<StructuredBinding> =
                 aliases.iter().copied().filter(|a| a.slot == slot).collect();
+            let table_strides: Vec<_> = structured_strides
+                .iter()
+                .filter(|(binding, _)| binding.slot == slot)
+                .collect();
             let Some(heap) = self.heap_of(table) else {
+                self.table_failed |= !table_strides.is_empty();
                 continue;
             };
             let Some(host) = heap.host() else {
+                self.table_failed |= !table_strides.is_empty();
                 continue;
             };
             let step_dwords: u32 = if heap.samplers() { 4 } else { 8 };
@@ -1422,12 +1463,22 @@ impl State {
                 .iter()
                 .map(|u| u.table_offset_dwords / step_dwords)
                 .chain(table_aliases.iter().map(|a| a.entry))
+                .chain(
+                    table_strides
+                        .iter()
+                        .map(|(b, _)| b.offset_dwords / step_dwords),
+                )
                 .min()
                 .unwrap_or(0);
             let max_slot = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / step_dwords)
                 .chain(table_aliases.iter().map(|a| a.entry))
+                .chain(
+                    table_strides
+                        .iter()
+                        .map(|(b, _)| b.offset_dwords / step_dwords),
+                )
                 .max()
                 .unwrap_or(0);
             // `UsedResource.table_offset_dwords` records the base of each static
@@ -1452,6 +1503,7 @@ impl State {
                 .checked_mul(step_bytes)
                 .and_then(|bytes| table.checked_add(bytes));
             if last.and_then(|end| heap.index(end)).is_none() {
+                self.table_failed |= !table_strides.is_empty();
                 for u in entries {
                     self.table_entry(list, u, compute);
                 }
@@ -1488,6 +1540,14 @@ impl State {
                 }
                 for alias in &table_aliases {
                     (alias.entry - start_slot, alias.stride).hash(&mut h);
+                }
+                for (binding, stride) in &table_strides {
+                    (
+                        binding.offset_dwords / step_dwords - start_slot,
+                        binding.uav,
+                        stride,
+                    )
+                        .hash(&mut h);
                 }
                 h.finish()
             };
@@ -1582,7 +1642,28 @@ impl State {
             for k in start_slot..=max_slot {
                 let index = first + (k - start_slot);
                 let at = table + u64::from(k) * step_bytes;
-                match crate::descriptor::view(at) {
+                let view = crate::descriptor::view(at);
+                if let Some((binding, stride)) = table_strides
+                    .iter()
+                    .find(|(b, _)| b.offset_dwords / step_dwords == k)
+                {
+                    // Check the same view that is copied to the list's heap.
+                    // Failure to mirror it must not bind a null of another kind.
+                    complete = view.is_some_and(|view| {
+                        crate::descriptor::host::structured_stride(&view, binding.uav)
+                            == Some(*stride)
+                            && host.make_at(index, &view)
+                    });
+                    if !complete {
+                        once!(
+                            slot,
+                            "a structured buffer view could not be bound at its required stride"
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                match view {
                     Some(View::Constant(address, size)) if address != 0 => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             complete = false;
@@ -1696,7 +1777,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.bound_pipeline(compute) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -1759,14 +1840,13 @@ impl State {
     }
 
     fn needs_rect_expansion(&self) -> bool {
-        self.topology == RECTANGLES
-            && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| !p.rects)
+        self.topology == RECTANGLES && self.bound_pipeline(false).is_some_and(|p| !p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.bound_pipeline(false) else {
             return false;
         };
         // The draw runs `count / 3 * 6` vertices, a count the host takes in
@@ -1926,7 +2006,7 @@ impl State {
         // Pipeline creation can still be in flight. Select the rectangle path
         // only from a finished pipeline, whose geometry stage is now known.
         let fallback = if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
-            let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            let Some(p) = self.bound_pipeline(false) else {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_drop(self.pipeline as This);
                 return false;
@@ -1958,7 +2038,7 @@ impl State {
             }
             let prepared = match crate::rectangles::expand(
                 list,
-                p,
+                &p,
                 &self.vertex,
                 (&args, arguments, stride, max),
                 counter.as_ref().map(|(s, at)| (s, *at)),
@@ -2034,8 +2114,8 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+            DISPATCH => match self.bound_pipeline(true) {
+                Some(p) if p.compute => self.bind(list, &p, true),
                 _ => false,
             },
             _ => false,
@@ -2044,7 +2124,7 @@ impl State {
         self.frame_op("indirect", kind == DISPATCH, ran);
         if !ran {
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
+            match self.bound_pipeline(kind == DISPATCH) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
                 Some(p) => why(&format!(
                     "prepare failed (compute {}, mesh {})",
@@ -4054,6 +4134,7 @@ mod bindless_tests {
         };
 
         let gfx_srv_uav = HostPipeline {
+            structured_strides: Vec::new(),
             compute: false,
             mesh: false,
             rects: false,
@@ -4071,6 +4152,7 @@ mod bindless_tests {
             name: "gfx_srv_uav".into(),
         };
         let gfx_srv_only = HostPipeline {
+            structured_strides: Vec::new(),
             compute: false,
             mesh: false,
             rects: false,
@@ -4088,6 +4170,7 @@ mod bindless_tests {
             name: "gfx_srv_only".into(),
         };
         let compute_srv = HostPipeline {
+            structured_strides: Vec::new(),
             compute: true,
             mesh: false,
             rects: false,

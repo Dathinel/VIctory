@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{StructuredBinding, UNKNOWN_STRUCTURED_STRIDE, UserData, ViewStride};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -79,20 +79,21 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave32(parts, true, None)
+    lower_with_wave32(parts, true, None, None)
 }
 
 pub(crate) fn lower_with_wave32(
     parts: &Parts,
     allow_wave32: bool,
     pixel_inputs: Option<&[SigElement]>,
+    view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false, allow_wave32, pixel_inputs) {
+    match lower_program(parts, false, allow_wave32, pixel_inputs, view_stride) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => {
-            lower_program(parts, true, allow_wave32, pixel_inputs)
+            lower_program(parts, true, allow_wave32, pixel_inputs, view_stride)
         }
         result => result,
     }
@@ -103,10 +104,12 @@ fn lower_program(
     numeric_selects: bool,
     allow_wave32: bool,
     pixel_inputs: Option<&[SigElement]>,
+    view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects, allow_wave32).run(pixel_inputs) {
+        match Lower::new(parts, &bad, numeric_selects, allow_wave32, view_stride).run(pixel_inputs)
+        {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -198,6 +201,7 @@ struct Lower<'a> {
     x: &'a Parts<'a>,
     /// Original to retained element ids for mesh vertex and primitive exports.
     mesh_output_ids: Option<[Vec<Option<usize>>; 2]>,
+    view_stride: Option<ViewStride<'a>>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -476,6 +480,7 @@ impl<'a> Lower<'a> {
         bad: &'a HashMap<Value, Why>,
         numeric_selects: bool,
         allow_wave32: bool,
+        view_stride: Option<ViewStride<'a>>,
     ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
@@ -607,6 +612,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             mesh_output_ids: None,
+            view_stride,
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -3567,7 +3573,8 @@ impl<'a> Lower<'a> {
             // a heap view of no listed kind is read as raw bytes.
             let stride = srv
                 .filter(|u| u.root == RootType::Table && u.stride > 4 && u.stride.is_multiple_of(4))
-                .map(|u| u.stride);
+                .map(|u| u.stride)
+                .or_else(|| self.bound_structured_stride(src, false, false));
             let h = match stride {
                 Some(stride) => self.handle(site, src, false, (12, stride))?,
                 None => self.handle(site, src, false, (11, 0))?,
@@ -3781,14 +3788,12 @@ impl<'a> Lower<'a> {
                     ((kind | u, 0x409), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
-                    let stride = used.map_or(0, |u| u.stride);
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
                         (10 | u, 0x409)
-                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
-                    {
-                        (12 | u, stride)
+                    } else if *idxen && format.is_none() {
+                        (12 | u, self.structured_stride(&src, uav)?)
                     } else {
                         (11 | u, 0)
                     };
@@ -4243,6 +4248,46 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    fn structured_stride(&self, src: &Source, uav: bool) -> Result<u32, Why> {
+        let valid = |stride: &u32| (4..=2048).contains(stride) && stride.is_multiple_of(4);
+        if let Some(stride) = self.used_kind(src).map(|u| u.stride).filter(valid) {
+            return Ok(stride);
+        }
+        self.bound_structured_stride(src, uav, true)
+            .ok_or(UNKNOWN_STRUCTURED_STRIDE)
+    }
+
+    fn bound_structured_stride(&self, src: &Source, uav: bool, required: bool) -> Option<u32> {
+        let view_stride = self.view_stride?;
+        let stride = |source: &Source| {
+            // shortcut: a descriptor selected by a dynamic index has no
+            // statically identifiable view to specialize this PSO with.
+            let Source::Loaded { load, first } = source else {
+                return None;
+            };
+            let address = self.scalar.get(load)?;
+            let param = self.x.native.layout.get(address.param)?;
+            let offset = address.offset.checked_add(4 * u32::from(*first))?;
+            if param.root != RootType::Table || address.dynamic.is_some() || offset % 32 != 0 {
+                return None;
+            }
+            view_stride(
+                StructuredBinding {
+                    slot: param.slot,
+                    offset_dwords: offset / 4,
+                    uav,
+                },
+                required,
+            )
+            .filter(|stride| (4..=2048).contains(stride) && stride.is_multiple_of(4))
+        };
+        // A selected handle has one DXIL annotation. Every possible view must
+        // supply the same stride for that instruction.
+        let mut strides = src.leaves().into_iter().map(stride);
+        let first = strides.next().flatten()?;
+        strides.all(|other| other == Some(first)).then_some(first)
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -7546,7 +7591,15 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = store
+            || atomic.is_some()
+            || used.is_some_and(|u| u.kind == ResourceType::Uav)
+            || (index.is_some() && !typed && used.is_none() && !self.buffer_loads_only(src));
+        if index.is_none() && !typed && self.bound_structured_stride(src, uav, false).is_some() {
+            // shortcut: byte addressing can cross structure boundaries.
+            // Indexed accesses use a matching structured view.
+            return Err("byte addressing of a buffer with a view-supplied stride");
+        }
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
@@ -7554,10 +7607,7 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = self.structured_stride(src, uav)?;
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
@@ -7637,10 +7687,7 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
+                        let stride = self.structured_stride(src, uav)?;
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                     }
@@ -7698,10 +7745,7 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = self.structured_stride(src, uav)?;
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     self.s.op(
                         c,

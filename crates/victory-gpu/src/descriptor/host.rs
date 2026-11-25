@@ -521,7 +521,7 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             if self.sampler {
@@ -530,7 +530,9 @@ impl HostHeap {
                 null_for(view, self.cpu(index));
             }
         }
+        let made = kept.is_some();
         self.keep(index, kept.unwrap_or(Kept::Empty));
+        made
     }
 
     /// Makes slot `index` (a dynamic one) a structured buffer alias with
@@ -1041,6 +1043,36 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+/// The stride of a matching structured buffer view. The shader declaration
+/// and its descriptor must agree on both the access class and element size.
+pub(crate) fn structured_stride(view: &View, uav: bool) -> Option<u32> {
+    let words = match (view, uav) {
+        (View::Shader(_, Some(words)), false) | (View::Unordered(_, _, Some(words)), true) => words,
+        (View::Placed(unordered, resource, words), _) if *unordered == uav && resource[0] == 1 => {
+            words[..10].try_into().ok()?
+        }
+        _ => return None,
+    };
+    let stride = if uav {
+        let desc = uav_desc(words);
+        if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+            return None;
+        }
+        // SAFETY: The view dimension selects the buffer member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        (buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE).then_some(buffer.StructureByteStride)?
+    } else {
+        let desc = srv_desc(words);
+        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+            return None;
+        }
+        // SAFETY: The view dimension selects the buffer member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        (buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE).then_some(buffer.StructureByteStride)?
+    };
+    ((4..=2048).contains(&stride) && stride.is_multiple_of(4)).then_some(stride)
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first
@@ -2969,6 +3001,41 @@ mod structured_alias_tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn structured_stride_requires_a_view_of_the_matching_access_class() {
+        let mut srv = [0; 10];
+        srv[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        srv[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv[6] = 2; // NumElements
+        srv[7] = 16; // StructureByteStride
+        assert_eq!(
+            structured_stride(&View::Shader(0, Some(srv)), false),
+            Some(16)
+        );
+        assert_eq!(structured_stride(&View::Shader(0, Some(srv)), true), None);
+
+        let mut uav = [0; 10];
+        uav[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+        uav[4] = 2; // NumElements
+        uav[5] = 32; // StructureByteStride
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(uav)), true),
+            Some(32)
+        );
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(uav)), false),
+            None
+        );
+
+        uav[5] = 6;
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(uav)), true),
+            None
+        );
+        srv[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        assert_eq!(structured_stride(&View::Shader(0, Some(srv)), false), None);
     }
 
     fn placed_raw_srv_handle(
