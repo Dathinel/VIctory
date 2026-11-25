@@ -45,6 +45,9 @@ pub(crate) struct Lowered {
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    /// Whether the program ballots active lanes (`waveActiveBallot`).
+    #[cfg(test)]
+    pub has_wave_ballot: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1209,6 +1212,8 @@ impl<'a> Lower<'a> {
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
+        #[cfg(test)]
+        let has_wave_ballot = self.s.m.has_dx_op("dx.op.waveActiveBallot", 116);
         Ok(Lowered {
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
@@ -1237,6 +1242,8 @@ impl<'a> Lower<'a> {
             has_fcmp_uno,
             #[cfg(test)]
             has_coverage_op,
+            #[cfg(test)]
+            has_wave_ballot,
         })
     }
 
@@ -4906,8 +4913,43 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Whether lane `src` is active in the current EXEC (via `waveActiveBallot`).
+    fn src_lane_active(&mut self, src: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let t = self.s.m.bool(true);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+        self.s.flags |= flags::WAVE_OPS;
+        let lo = self.s.m.extract(c, ballot, 0);
+        let (k31, k32, one, z) = (
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let word = if self.wave() > 32 {
+            let hi = self.s.m.extract(c, ballot, 1);
+            let low = self.s.m.cmp(c, pred::IULT, src, k32);
+            self.s.m.select(c, low, lo, hi)
+        } else {
+            lo
+        };
+        let sh = self.s.m.bin(c, Bin::And, src, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        self.s.m.cmp(c, pred::NE, bit, z)
+    }
+
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
+    ///
+    /// When `fi` is clear, an inactive source lane is out of bounds the same
+    /// way a row-bound miss is: `bound_ctrl` selects zero, else the lane
+    /// keeps its old destination. DPP8 has no `bound_ctrl` bit and always
+    /// zeros inactive sources when `fi` is clear.
     fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -4918,9 +4960,15 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        let fi = match dpp {
+            Dpp::Lanes { fi, .. } | Dpp::Row { fi, .. } => fi,
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
+        } else if !fi {
+            // Inactive-source checks need a wave ballot; mesh cannot.
+            self.cross_lane(false)?;
         }
         let c = self.cur;
         let lane = self.lane_index();
@@ -4928,7 +4976,8 @@ impl<'a> Lower<'a> {
         let (sixteen_mask, low) = (k(self, !15), k(self, 15));
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
-        // Source lane, and whether it lies in the row.
+        // Source lane, whether it lies in the row, and bound_ctrl (zero on
+        // miss). DPP8 always zeros inactive sources when `fi` is clear.
         let (src, inside, masks, zero) = match dpp {
             Dpp::Lanes { sel, .. } => {
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
@@ -4938,7 +4987,7 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, true)
             }
             Dpp::Row {
                 ctrl,
@@ -5002,8 +5051,17 @@ impl<'a> Lower<'a> {
         } else {
             self.read_lane(x, src)
         };
+        // Geometric bounds, and source EXEC when fetch-inactive is clear.
+        let mut valid = inside;
+        if !fi {
+            let active = self.src_lane_active(src);
+            valid = Some(match valid {
+                Some(v) => self.s.m.bin(c, Bin::And, v, active),
+                None => active,
+            });
+        }
         let mut enable = None;
-        if let Some(inside) = inside {
+        if let Some(inside) = valid {
             if zero {
                 let z = k(self, 0);
                 r = self.s.m.select(c, inside, r, z);
@@ -9438,6 +9496,94 @@ mod tests {
             S_ENDPGM,
         ];
         lowers_lds(&words).unwrap();
+    }
+
+    /// VOP1 DPP16: `v_mov_b32_dpp vdst, vsrc row_shr:1` with `bound_ctrl` and `fi`.
+    const fn vop1_dpp16_row_shr1(vdst: u8, vsrc: u8, bound_ctrl: bool, fi: bool) -> [u32; 2] {
+        [
+            0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 0xFA,
+            (0xFu32) << 28
+                | 0xF << 24
+                | (bound_ctrl as u32) << 19
+                | (fi as u32) << 18
+                | 0x111 << 8
+                | vsrc as u32,
+        ]
+    }
+
+    /// VOP1 DPP8: `v_mov_b32_dpp vdst, vsrc dpp8:[1,0,3,2,5,4,7,6]` (`fi` via 0xEA).
+    const fn vop1_dpp8_swap(vdst: u8, vsrc: u8, fi: bool) -> [u32; 2] {
+        let src0 = if fi { 0xEAu32 } else { 0xE9 };
+        let sel = 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+        [
+            0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | src0,
+            sel << 8 | vsrc as u32,
+        ]
+    }
+
+    /// Lowers a 32-thread compute shader that uses LDS (so the DPP result is
+    /// consumed) and returns the lowered module.
+    fn lower_wave32_dpp(words: &[u32]) -> Lowered {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("lower")
+    }
+
+    /// VIC-BT-008: with `fi:0`, DPP must ballot active lanes so inactive
+    /// sources follow `bound_ctrl` (zero / preserve dest). With `fi:1`, no
+    /// ballot is required for that check.
+    #[test]
+    fn dpp_fetch_inactive_ballots_source_lane_activity() {
+        let end = [0x7E04_0280u32, 0xD834_0000, 0x0000_0102, S_ENDPGM]; // v2=0; ds_write_b32 v2, v1
+        let with_fi = |fi: bool| {
+            let mut w = Vec::new();
+            w.extend_from_slice(&vop1_dpp16_row_shr1(1, 0, true, fi));
+            w.extend_from_slice(&end);
+            lower_wave32_dpp(&w)
+        };
+        assert!(
+            with_fi(false).has_wave_ballot,
+            "fi:0 must waveActiveBallot for source EXEC"
+        );
+        assert!(
+            !with_fi(true).has_wave_ballot,
+            "fi:1 must not ballot just to read inactive sources"
+        );
+        // DPP8 with fi:0 also ballots; fi:1 does not.
+        let dpp8 = |fi: bool| {
+            let mut w = Vec::new();
+            w.extend_from_slice(&vop1_dpp8_swap(1, 0, fi));
+            w.extend_from_slice(&end);
+            lower_wave32_dpp(&w)
+        };
+        assert!(dpp8(false).has_wave_ballot);
+        assert!(!dpp8(true).has_wave_ballot);
     }
 
     #[test]
