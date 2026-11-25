@@ -886,16 +886,6 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
-impl Deferred {
-    /// Whether a fill of upload memory at `dst` from title memory at `src`
-    /// (`len` bytes) is not yet among the steps since the last title copy
-    /// (and notes it). Kept with the refreshed ranges: both are forgotten
-    /// when a title copy may have changed their source.
-    fn first_fill(&mut self, dst: usize, src: usize, len: usize) -> bool {
-        self.refreshed.insert((dst, src, len))
-    }
-}
-
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -1062,6 +1052,11 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // D3D12 requires NumCommandLists >= 1; an empty submission is a no-op
+        // (VIC-BT-035 / #440).
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1998,26 +1993,6 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
-    /// Copies `len` bytes of title memory at `src` into `dst` (mapped inside
-    /// `upload`) when the list is submitted, keeping `upload` alive until the
-    /// list is reset.
-    pub(crate) fn defer_fill_upload(
-        &self,
-        upload: ID3D12Resource,
-        dst: *mut u8,
-        src: *const u8,
-        len: usize,
-    ) {
-        self.mark_work();
-        let mut d = self.deferred();
-        // Every draw or dispatch that binds the slot asks; until a title
-        // copy intervenes another fill would copy the same bytes again.
-        if d.first_fill(dst as usize, src as usize, len) {
-            d.uploads.push(upload);
-            d.copies.push(Step::Fill(dst as usize, src as usize, len));
-        }
-    }
-
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -2632,24 +2607,30 @@ pub fn write_title_memory(destination: usize, bytes: &[u8]) -> bool {
     written
 }
 
-/// `NtWriteVirtualMemory`, looked up once. `WriteProcessMemory` asks the
-/// kernel about the destination's region first (to flush the instruction
-/// cache of executable memory), which in the title's big pools walks page
-/// tables for about 2 ms a call: the copy back after a world submission
-/// spent over a second there. The system call itself writes the same bytes
-/// and reports a page it cannot write the same way.
-fn nt_write_virtual_memory() -> Option<NtWrite> {
+#[derive(Clone, Copy)]
+enum CopyBack {
+    WineRead,
+    NativeWrite(NtWrite),
+}
+
+/// Select the checked same-process copy once. Proton's read path is much
+/// cheaper for the small rows and pages written back after a submission.
+fn copy_back_method() -> Option<CopyBack> {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-    static CALL: std::sync::OnceLock<Option<NtWrite>> = std::sync::OnceLock::new();
-    *CALL.get_or_init(|| {
-        // SAFETY: ntdll is always loaded; the symbol has this signature.
+    static METHOD: std::sync::OnceLock<Option<CopyBack>> = std::sync::OnceLock::new();
+    *METHOD.get_or_init(|| {
+        // SAFETY: ntdll is always loaded. Wine identifies itself by this export;
+        // on native Windows the write routine has the NtWrite signature.
         unsafe {
             let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            if GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some() {
+                return Some(CopyBack::WineRead);
+            }
             let f = GetProcAddress(ntdll, c"NtWriteVirtualMemory".as_ptr().cast())?;
-            Some(std::mem::transmute::<
+            Some(CopyBack::NativeWrite(std::mem::transmute::<
                 unsafe extern "system" fn() -> isize,
                 NtWrite,
-            >(f))
+            >(f)))
         }
     })
 }
@@ -2665,21 +2646,19 @@ type NtWrite = unsafe extern "system" fn(
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
-/// Through `NtWriteVirtualMemory`: the kernel refuses an unmapped
-/// destination page as it does a source page, without asking first for the
-/// destination's region, which `WriteProcessMemory` does at
-/// `VirtualQuery`'s cost (see [`copy_mapped`]). `WriteProcessMemory` is not
-/// a substitute here: it would make read-only pages writable for the copy,
-/// writing around the watch in [`crate::watch`] without the fault it needs.
-/// ntdll exports the symbol on every Windows, so a missing one leaves the
-/// copy back undone rather than patched up.
+/// Wine uses the checked read into the destination. Native Windows uses
+/// the NT write directly, avoiding the region query and temporary changes
+/// to read-only page protections that WriteProcessMemory can perform.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let Some(call) = nt_write_virtual_memory() else {
+    let Some(method) = copy_back_method() else {
         return;
     };
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        let CopyBack::NativeWrite(call) = method else {
+            return read(from, at as *mut u8, n);
+        };
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
@@ -2825,6 +2804,33 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    // Run on both revisions with --ignored --nocapture to measure the active path.
+    #[test]
+    #[ignore = "local copy-back timing"]
+    fn time_small_copy_backs() {
+        const ROW: usize = 4096;
+        let source = vec![0xf3; ROW * 1024];
+        let mut dest = vec![0; source.len()];
+        let mut samples = Vec::new();
+        for round in 0..10 {
+            dest.fill(0);
+            let start = std::time::Instant::now();
+            for offset in (0..source.len()).step_by(ROW) {
+                write_mapped(dest[offset..].as_mut_ptr(), source[offset..].as_ptr(), ROW);
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(dest, source);
+            if round >= 2 {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "1024 x 4 KiB copy-backs, median {:?}",
+            (samples[3] + samples[4]) / 2
+        );
     }
 
     #[test]
@@ -3988,22 +3994,6 @@ mod tests {
         assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
     }
 
-    /// A slot's upload fill is asked for by every draw that binds it: the
-    /// list takes it once, and again only after a title copy (which forgets
-    /// what was refreshed, as `defer_copy` and `defer` do).
-    #[test]
-    fn an_upload_fill_is_taken_once_until_a_title_copy() {
-        let mut d = Deferred::default();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
-        assert!(!d.first_fill(0x1000, 0x2000, 24));
-        // Another source, length or upload is a fill of its own.
-        assert!(d.first_fill(0x1000, 0x2018, 24));
-        assert!(d.first_fill(0x1000, 0x2000, 48));
-        assert!(d.first_fill(0x3000, 0x2000, 24));
-        d.refreshed.clear();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
-    }
-
     #[test]
     fn adapter_filter_matches_case_insensitively() {
         assert!(adapter_matches("NVIDIA GeForce RTX 3070 Ti", "rtx 3070"));
@@ -4143,6 +4133,18 @@ mod tests {
         assert_eq!(d3.load(Ordering::SeqCst), 0);
         submitted.end_submit();
         assert_eq!(d3.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_execute_does_not_submit() {
+        // D3D12 forbids ExecuteCommandLists with NumCommandLists == 0.
+        let Some(host) = host() else {
+            return;
+        };
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[]);
+        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(before, after, "empty execute must not bump the fence");
     }
 
     #[test]

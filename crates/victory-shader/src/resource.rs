@@ -181,7 +181,60 @@ pub fn track(
     let mut pending_waterfall_loads = std::collections::BTreeMap::<Site, Vec<Value>>::new();
     let mut address_waterfall_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
-    for (b, block) in p.blocks.iter().enumerate() {
+    // Visit in reverse postorder and collect every scalar address before any
+    // descriptor looks it up: after split_irreducible appends copies, a
+    // consumer block can have a lower index than the s_load that defines its
+    // descriptor, so index order would miss the load in out.scalar.
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    for &b in &order {
+        let block = &p.blocks[b];
+        for (i, inst) in block.insts.iter().enumerate() {
+            let site = (b, i);
+            let fail = |what| ShaderError::Unsupported {
+                offset: inst.machine.offset,
+                what,
+            };
+            match &inst.fields {
+                Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } if !inst.name().starts_with("s_buffer_")
+                    && (inst.name().contains("_load_") || inst.name().contains("_store_")) =>
+                {
+                    let address = match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(a) => a,
+                        Err("an address read from the first lane of a per-lane value") => {
+                            let (a, reads) = t
+                                .smem_waterfall_address(b, inst, base, *offset, soffset)
+                                .ok_or_else(|| {
+                                    fail("an address read from the first lane of a per-lane value")
+                                })?;
+                            pending_waterfall_loads.insert(site, reads);
+                            a
+                        }
+                        Err(what) => return Err(fail(what)),
+                    };
+                    out.scalar.push((site, address));
+                }
+                Fields::Flat {
+                    addr,
+                    saddr,
+                    offset,
+                    ..
+                } if inst.name().starts_with("global_") => {
+                    let address = t
+                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .map_err(fail)?;
+                    out.scalar.push((site, address));
+                }
+                _ => {}
+            }
+        }
+    }
+    for &b in &order {
+        let block = &p.blocks[b];
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
             let fail = |what| ShaderError::Unsupported {
@@ -211,6 +264,10 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                // A ray query is lowered as a miss and never reads its BVH
+                // descriptor, which the shader typically builds from a base
+                // address in a loop; there is nothing to trace.
+                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -227,38 +284,6 @@ pub fn track(
                 Fields::Buffer { .. } => {}
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
-                }
-                Fields::Smem {
-                    base,
-                    offset,
-                    soffset,
-                    ..
-                } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = match t.smem_address(inst, base, *offset, soffset) {
-                        Ok(a) => a,
-                        Err("an address read from the first lane of a per-lane value") => {
-                            let (a, reads) = t
-                                .smem_waterfall_address(b, inst, base, *offset, soffset)
-                                .ok_or_else(|| {
-                                    fail("an address read from the first lane of a per-lane value")
-                                })?;
-                            pending_waterfall_loads.insert(site, reads);
-                            a
-                        }
-                        Err(what) => return Err(fail(what)),
-                    };
-                    out.scalar.push((site, address));
-                }
-                Fields::Flat {
-                    addr,
-                    saddr,
-                    offset,
-                    ..
-                } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
-                    out.scalar.push((site, address));
                 }
                 _ => {}
             }
@@ -4077,6 +4102,77 @@ pub(crate) mod tests {
             panic!("{:?}", image.source)
         };
         assert_eq!(load.0, 1);
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// After `split_irreducible` appends copies, a block's index can sit
+    /// before a dominating `s_load` in vector order while reverse postorder
+    /// still visits the load first. `track` must follow RPO (and collect
+    /// scalar addresses before descriptor uses) so the waterfall offset
+    /// load is not missed.
+    #[test]
+    fn waterfall_offset_loads_follow_rpo_not_block_indices() {
+        let code: Vec<u8> = WATERFALL_INDEXED_WAVE32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let mut p = crate::ir::build(&code, false, 256).unwrap();
+        let n = p.blocks.len();
+        assert!(n >= 3, "prologue, loop, epilogue: {n}");
+        // Rotate non-entry blocks so the loop body moves to the highest
+        // index while a later-RPO block occupies a lower one: index order
+        // no longer matches reverse postorder.
+        let rotate = |b: usize| {
+            if b == 0 {
+                0
+            } else {
+                1 + (b - 1 + n - 2) % (n - 1)
+            }
+        };
+        let mut moved = vec![p.blocks[0].clone(); n];
+        for (b, block) in p.blocks.iter().enumerate() {
+            moved[rotate(b)] = block.clone();
+        }
+        for block in &mut moved {
+            match &mut block.exit {
+                crate::ir::Exit::Jump(s) => *s = rotate(*s),
+                crate::ir::Exit::Branch { taken, not_taken } => {
+                    *taken = rotate(*taken);
+                    *not_taken = rotate(*not_taken);
+                }
+                crate::ir::Exit::End | crate::ir::Exit::Indirect => {}
+            }
+        }
+        for block in &mut moved {
+            block.preds.clear();
+        }
+        for b in 0..n {
+            for s in moved[b].exit.successors() {
+                moved[s].preds.push(b);
+            }
+        }
+        p.blocks = moved;
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        assert_ne!(
+            order,
+            (0..n).collect::<Vec<_>>(),
+            "rotation must desync index order from RPO: {order:?}"
+        );
+
+        let layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let r = track(&p, &layout, HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        let (_, address) = r.scalar.iter().find(|s| s.0 == load).unwrap();
+        assert!(address.dynamic.is_some(), "{address:?}");
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
