@@ -144,7 +144,7 @@ impl Heap {
             false,
         );
         let [tag, index, generation] = record;
-        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
         let (view, current) = views.list.get(index as usize)?;
         if tag != VIEW_TAG || *current != generation {
             return None;
