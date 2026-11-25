@@ -5,6 +5,7 @@ This fork branch preserves source examples independently of pull request branche
 | Source | Operation |
 | --- | --- |
 | bc1-records.hlsl | Reconstruct BC1 blocks from post-entropy records |
+| [bc3-pack/pack.hlsl](bc3-pack/README.md) | Pack BC3 alpha and color from endpoints and pixel ranks |
 | bc4-alpha.hlsl | Pack two endpoints and sixteen ranks into a BC4 block |
 | bc4-records.hlsl | Reconstruct BC4 blocks from post-entropy records |
 | bc6-wide.hlsli, bc6-add-endpoint.hlsli | Interleave two byte lanes, decode the residual and add it to a reference endpoint |
