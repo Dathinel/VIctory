@@ -547,6 +547,94 @@ fn permlanex16_reads_a_lane_of_the_other_row() {
     lowers_lds(&words).unwrap();
 }
 
+/// VOP1 DPP16: `v_mov_b32_dpp vdst, vsrc row_shr:1` with `bound_ctrl` and `fi`.
+const fn vop1_dpp16_row_shr1(vdst: u8, vsrc: u8, bound_ctrl: bool, fi: bool) -> [u32; 2] {
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 0xFA,
+        (0xFu32) << 28
+            | 0xF << 24
+            | (bound_ctrl as u32) << 19
+            | (fi as u32) << 18
+            | 0x111 << 8
+            | vsrc as u32,
+    ]
+}
+
+/// VOP1 DPP8: `v_mov_b32_dpp vdst, vsrc dpp8:[1,0,3,2,5,4,7,6]` (`fi` via 0xEA).
+const fn vop1_dpp8_swap(vdst: u8, vsrc: u8, fi: bool) -> [u32; 2] {
+    let src0 = if fi { 0xEAu32 } else { 0xE9 };
+    let sel = 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | src0,
+        sel << 8 | vsrc as u32,
+    ]
+}
+
+/// Lowers a 32-thread compute shader that uses LDS (so the DPP result is
+/// consumed) and returns the lowered module.
+fn lower_wave32_dpp(words: &[u32]) -> Lowered {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, false, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("lower")
+}
+
+/// VIC-BT-008: with `fi:0`, DPP must ballot active lanes so inactive
+/// sources follow `bound_ctrl` (zero / preserve dest). With `fi:1`, no
+/// ballot is required for that check.
+#[test]
+fn dpp_fetch_inactive_ballots_source_lane_activity() {
+    let end = [0x7E04_0280u32, 0xD834_0000, 0x0000_0102, S_ENDPGM]; // v2=0; ds_write_b32 v2, v1
+    let with_fi = |fi: bool| {
+        let mut w = Vec::new();
+        w.extend_from_slice(&vop1_dpp16_row_shr1(1, 0, true, fi));
+        w.extend_from_slice(&end);
+        lower_wave32_dpp(&w)
+    };
+    assert!(
+        with_fi(false).has_wave_ballot,
+        "fi:0 must waveActiveBallot for source EXEC"
+    );
+    assert!(
+        !with_fi(true).has_wave_ballot,
+        "fi:1 must not ballot just to read inactive sources"
+    );
+    // DPP8 with fi:0 also ballots; fi:1 does not.
+    let dpp8 = |fi: bool| {
+        let mut w = Vec::new();
+        w.extend_from_slice(&vop1_dpp8_swap(1, 0, fi));
+        w.extend_from_slice(&end);
+        lower_wave32_dpp(&w)
+    };
+    assert!(dpp8(false).has_wave_ballot);
+    assert!(!dpp8(true).has_wave_ballot);
+}
+
 #[test]
 fn a_compressed_export_unpacks_two_f16_channels_per_dword() {
     // A compr export: each source dword packs two f16 channels, the
