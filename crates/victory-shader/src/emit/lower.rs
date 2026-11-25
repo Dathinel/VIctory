@@ -22,6 +22,13 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// What an indexed buffer access addresses with its index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexedStride {
+    Raw,
+    Structured(u32),
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -4001,7 +4008,10 @@ impl<'a> Lower<'a> {
                     {
                         (10 | u, 0x409)
                     } else if *idxen && format.is_none() {
-                        (12 | u, self.structured_stride(&src, uav)?)
+                        match self.indexed_stride(&src, uav)? {
+                            IndexedStride::Raw => (11 | u, 0),
+                            IndexedStride::Structured(stride) => (12 | u, stride),
+                        }
                     } else {
                         (11 | u, 0)
                     };
@@ -4561,16 +4571,40 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    fn structured_stride(&self, src: &Source, uav: bool) -> Result<u32, Why> {
+    /// How an indexed (`idxen`) access addresses the buffer. A stride the
+    /// console metadata declares is used as given. Failing that, the bound
+    /// view decides: a stride of exactly zero is a flat byte buffer, which
+    /// is a raw access (the index contributes `index * 0`), not a structured
+    /// buffer of unknown stride.
+    fn indexed_stride(&self, src: &Source, uav: bool) -> Result<IndexedStride, Why> {
         let valid = |stride: &u32| (4..=2048).contains(stride) && stride.is_multiple_of(4);
         if let Some(stride) = self.used_kind(src).map(|u| u.stride).filter(valid) {
-            return Ok(stride);
+            return Ok(IndexedStride::Structured(stride));
         }
-        self.bound_structured_stride(src, uav, true)
-            .ok_or(UNKNOWN_STRUCTURED_STRIDE)
+        match self.bound_view_stride(src, uav, true) {
+            Some(0) => Ok(IndexedStride::Raw),
+            Some(stride) => Ok(IndexedStride::Structured(stride)),
+            None => Err(UNKNOWN_STRUCTURED_STRIDE),
+        }
+    }
+
+    /// The structured view of an indexed access: its index and stride, or
+    /// `None` when the bound view is raw and the index drops out.
+    fn structured_index(&self, src: &Source, uav: bool, index: V) -> Result<Option<(V, u32)>, Why> {
+        Ok(match self.indexed_stride(src, uav)? {
+            IndexedStride::Raw => None,
+            IndexedStride::Structured(stride) => Some((index, stride)),
+        })
     }
 
     fn bound_structured_stride(&self, src: &Source, uav: bool, required: bool) -> Option<u32> {
+        self.bound_view_stride(src, uav, required)
+            .filter(|&stride| stride != 0)
+    }
+
+    /// The stride every possible view of `src` supplies: 0 for raw, else a
+    /// valid structured stride.
+    fn bound_view_stride(&self, src: &Source, uav: bool, required: bool) -> Option<u32> {
         let view_stride = self.view_stride?;
         let stride = |source: &Source| {
             // shortcut: a descriptor selected by a dynamic index has no
@@ -4592,7 +4626,9 @@ impl<'a> Lower<'a> {
                 },
                 required,
             )
-            .filter(|stride| (4..=2048).contains(stride) && stride.is_multiple_of(4))
+            .filter(|stride| {
+                *stride == 0 || ((4..=2048).contains(stride) && stride.is_multiple_of(4))
+            })
         };
         // A selected handle has one DXIL annotation. Every possible view must
         // supply the same stride for that instruction.
@@ -8288,9 +8324,12 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
-                Some(index) => {
-                    let stride = self.structured_stride(src, uav)?;
+            let indexed = match index {
+                Some(index) => self.structured_index(src, uav, index)?,
+                None => None,
+            };
+            let (h, coords) = match indexed {
+                Some((index, stride)) => {
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
@@ -8368,9 +8407,12 @@ impl<'a> Lower<'a> {
                 }
                 (69, "bufferStore.f32")
             } else {
-                match index {
-                    Some(index) => {
-                        let stride = self.structured_stride(src, uav)?;
+                let indexed = match index {
+                    Some(index) => self.structured_index(src, uav, index)?,
+                    None => None,
+                };
+                match indexed {
+                    Some((index, stride)) => {
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                     }
@@ -8441,7 +8483,7 @@ impl<'a> Lower<'a> {
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
-            let selector = (!uav && used.is_none())
+let selector = (!uav && used.is_none())
                 .then(|| self.buffer_selector(src))
                 .flatten();
             match (index, selector) {
@@ -8474,18 +8516,32 @@ impl<'a> Lower<'a> {
                         &[h, byte, iu, mask, align],
                     )
                 }
-                (Some(index), None) => {
-                    let stride = self.structured_stride(src, uav)?;
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
-                }
+                (Some(index), None) => match self.structured_index(src, uav, index)? {
+                    Some((index, stride)) => {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    }
+                    // Zero-stride view: index * 0 drops out, so this is a raw
+                    // byte load at `off` (#462).
+                    None => {
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, off, iu, mask, align],
+                        )
+                    }
+                },
                 (None, _) => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
                     self.s.op(
