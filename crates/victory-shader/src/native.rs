@@ -347,9 +347,11 @@ impl PsRsrc2 {
         self.user_sgprs()
     }
 
-    /// The POPS collision wave id (`LOAD_COLLISION_WAVEID`, bit 25) after
-    /// the primitive mask: bits 0-9 this wave's id, 16-25 the newest earlier
-    /// wave it overlaps, 28-29 the packer, 31 whether it overlaps any.
+    /// The SGPR the POPS collision wave id arrives in (`LOAD_COLLISION_WAVEID`,
+    /// bit 25), after the primitive mask: bits 0-9 this wave's id, 16-25 the
+    /// newest earlier wave it overlaps, 28-29 the packer, 31 whether it overlaps
+    /// any. A program that reads it waits for the earlier waves that cover its
+    /// pixels (primitive-ordered pixel shading).
     pub fn collision_wave_id_sgpr(self) -> Option<u8> {
         (self.0 >> 25 & 1 != 0).then(|| self.prim_mask_sgpr() + 1)
     }

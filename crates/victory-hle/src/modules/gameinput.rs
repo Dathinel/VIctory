@@ -1408,39 +1408,144 @@ mod host {
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons, on the
     /// stand-in or, while one is connected, on the first host pad).
+    ///
+    /// `VICTORY_KEYS_FILE=<path>` also presses each key named on a line of
+    /// that file, read while the title runs, so a person or a script can
+    /// append keys as screens appear instead of guessing load times.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
+                    key_code(key.trim())?,
                 ))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        let mut down: Vec<u8> = keys
+            .iter()
+            .filter(|&&(at, _)| (at..at + KEY_HOLD).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(key_file());
+        down
+    }
+
+    /// How long a scripted key stays down.
+    #[cfg(feature = "diagnostics")]
+    const KEY_HOLD: Duration = Duration::from_millis(200);
+    /// How long `VICTORY_KEYS_FILE` waits between keys, so each reads as a
+    /// separate press.
+    #[cfg(feature = "diagnostics")]
+    const KEY_GAP: Duration = Duration::from_millis(200);
+
+    /// The key `VICTORY_KEYS_FILE` holds down now, reading the file at most
+    /// every 0.1 s.
+    #[cfg(feature = "diagnostics")]
+    fn key_file() -> Option<u8> {
+        struct File {
+            path: Option<std::path::PathBuf>,
+            feed: KeyFeed,
+            read_at: Option<Instant>,
+        }
+        static FILE: LazyLock<Mutex<File>> = LazyLock::new(|| {
+            Mutex::new(File {
+                path: std::env::var_os("VICTORY_KEYS_FILE").map(Into::into),
+                feed: KeyFeed::default(),
+                read_at: None,
+            })
+        });
+        let mut file = FILE.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = file.path.clone()?;
+        let now = Instant::now();
+        if file
+            .read_at
+            .is_none_or(|at| now - at >= Duration::from_millis(100))
+        {
+            file.read_at = Some(now);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                file.feed.feed(&text);
+            }
+        }
+        file.feed.key(now)
+    }
+
+    /// Keys named one per line in a growing text, pressed one at a time.
+    #[cfg(feature = "diagnostics")]
+    #[derive(Default)]
+    struct KeyFeed {
+        /// Bytes of the text already turned into keys.
+        read: usize,
+        queue: VecDeque<u8>,
+        /// The key pressed last and when.
+        pressed: Option<(Instant, u8)>,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    impl KeyFeed {
+        /// Queues the keys on the whole lines of `text` past those already
+        /// read; a line still being written waits for its newline.
+        fn feed(&mut self, text: &str) {
+            let Some(new) = text.get(self.read..) else {
+                return;
+            };
+            let whole = new.rfind('\n').map_or(0, |i| i + 1);
+            self.read += whole;
+            for name in new[..whole].lines().map(str::trim) {
+                match key_code(name) {
+                    Some(vk) => {
+                        tracing::info!(key = name, "VICTORY_KEYS_FILE key queued");
+                        self.queue.push_back(vk);
+                    }
+                    None if !name.is_empty() => {
+                        tracing::warn!(key = name, "VICTORY_KEYS_FILE key unknown");
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        /// The key down at `now`: each queued key for `KEY_HOLD`, then
+        /// nothing for `KEY_GAP`.
+        fn key(&mut self, now: Instant) -> Option<u8> {
+            if let Some((at, vk)) = self.pressed {
+                let since = now.saturating_duration_since(at);
+                if since < KEY_HOLD {
+                    return Some(vk);
+                }
+                if since < KEY_HOLD + KEY_GAP {
+                    return None;
+                }
+                self.pressed = None;
+            }
+            let vk = self.queue.pop_front()?;
+            self.pressed = Some((now, vk));
+            Some(vk)
+        }
+    }
+
+    /// The virtual key a scripted key name stands for.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
     }
 
     /// The keyboard state `ToUnicodeEx` reads with the keys `held` down:
@@ -1575,6 +1680,38 @@ mod host {
         assert_eq!(typed(0x20, &[0x20]), (0x20, false));
         assert_eq!(typed(0x0D, &[0x0D]), (0x0D, false));
         assert_eq!(typed(0x70, &[0x70]), (0, false));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn key_file_presses_whole_lines_one_key_at_a_time() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut feed = KeyFeed::default();
+        // The last line has no newline yet; an unknown name is skipped.
+        let mut text = String::from("Down\nNope\n\nDo");
+        feed.feed(&text);
+        assert_eq!(feed.key(at(0)), Some(0x28));
+        assert_eq!(feed.key(at(199)), Some(0x28));
+        assert_eq!(feed.key(at(200)), None);
+        assert_eq!(feed.key(at(400)), None, "nothing queued after the gap");
+        text.push_str("wn\nEnter\nx\n");
+        feed.feed(&text);
+        feed.feed(&text);
+        let pressed: Vec<_> = (400..2000)
+            .step_by(100)
+            .map(|ms| feed.key(at(ms)))
+            .collect();
+        let d = Some(0x28);
+        let e = Some(0x0D);
+        let x = Some(b'X');
+        #[rustfmt::skip]
+        assert_eq!(pressed, [
+            d, d, None, None,
+            e, e, None, None,
+            x, x, None, None,
+            None, None, None, None,
+        ]);
     }
 }
 

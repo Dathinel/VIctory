@@ -57,11 +57,18 @@ fn results(words: &[u32], comparison: bool) -> Vec<(&'static str, [f32; 4])> {
     let texels: Vec<[f32; 4]> = (0..16)
         .map(|i| [(10 * (i / 4) + i % 4) as f32, 0.0, 0.0, 1.0])
         .collect();
-    let views = [
-        View::Texture(4, 4, &texels),
-        View::Texture(4, 4, &texels),
-        View::RawUav(32),
-    ];
+    // Comparison sampling needs a format with comparison support (R32F, a
+    // depth texture's view). RGBA32F has none on NVIDIA or WARP; WARP
+    // compared anyway, NVIDIA returned the texels uncompared.
+    let reds: Vec<f32> = texels.iter().map(|t| t[0]).collect();
+    let texture = || {
+        if comparison {
+            View::DepthTexture(4, 4, &reds)
+        } else {
+            View::Texture(4, 4, &texels)
+        }
+    };
+    let views = [texture(), texture(), View::RawUav(32)];
     let filter = if comparison {
         D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT
     } else {
