@@ -196,6 +196,12 @@ If a hash differs, restore that file from your verified backup and rerun with
 the same build of VIctory and the same options. A breakpoint can have other
 causes. Include the archive verification outcome in your test report.
 
+Set `VICTORY_WAVE64_DOUBLE=1` to let a 32-lane host run a straight-line
+64-thread compute group that reads indexed lanes across the two halves.
+The initial form handles integer register operations, dword LDS reads and
+writes, and raw UAV stores. It uses no extra LDS. Other programs retain
+their usual translation. The option has separate shader cache entries.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell
