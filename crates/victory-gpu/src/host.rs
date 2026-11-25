@@ -756,6 +756,8 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Work that writes host memory and reads a known title memory range.
+    HostRead(usize, usize, Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -2205,6 +2207,20 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// As [`HostList::defer_host`], for work that reads title memory `[src, src + len)`
+    /// in place at submission (holding a byte-range mapping guard over that range).
+    pub(crate) fn defer_host_read(
+        &self,
+        src: *const u8,
+        len: usize,
+        work: impl Fn() + Send + 'static,
+    ) {
+        self.mark_work();
+        self.deferred()
+            .copies
+            .push(Step::HostRead(src as usize, len, Box::new(work)));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -2259,6 +2275,16 @@ impl HostList {
                             started = std::time::Instant::now();
                         }
                     }
+                    work();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                    }
+                    continue;
+                }
+                Step::HostRead(src, len, work) => {
+                    let _mapped = crate::watch::title_memory_reading(*src, *len);
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2975,6 +3001,22 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            let [changes, waiting, under_way] = [0, 1, 2].map(|i| {
+                crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64
+                    / [1.0, 1e3, 1e3][i]
+                    / frames
+            });
+            if changes > 0.0 {
+                tracing::info!(
+                    "changes of title memory's mapping per frame: {changes:.0}, {waiting:.1} ms of them waiting for reads in place, \
+                     {under_way:.1} ms under way (each holds {}; VICTORY_MAPPING_RANGES=0 holds all of title memory)",
+                    if crate::watch::by_range() {
+                        "the bytes it changes"
+                    } else {
+                        "all of title memory"
+                    }
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -4131,5 +4173,59 @@ mod wave_tests {
         assert!(wave32_supported(true, 4, 128)); // WARP
         assert!(!wave32_supported(true, 64, 64)); // Wave64-only (GCN/Vega)
         assert!(!wave32_supported(false, 32, 32)); // No wave ops
+    }
+
+    /// `defer_host_read` runs after preceding deferred copies and holds a
+    /// byte-range mapping guard over its source range while executing.
+    #[test]
+    fn defer_host_read_guards_its_range_against_overlapping_remaps() {
+        let _retire = super::isolated_retire_scope();
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().expect("host list");
+        let src = [0x5Au8; 64];
+        let mut dst = [0u8; 64];
+        let dst_ptr = dst.as_mut_ptr();
+        let dst_addr = dst_ptr as usize;
+        list.defer_copy(dst_ptr, src.as_ptr(), src.len());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let observed_read = observed.clone();
+        list.defer_host_read(dst_ptr, 64, move || {
+            // SAFETY: `dst` lives until after `run_deferred` finishes.
+            let first = unsafe { *(dst_addr as *const u8) };
+            observed_read.store(first, std::sync::atomic::Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let remapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let remapped_worker = remapped.clone();
+        let waiter = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let remap = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let _guard = crate::watch::title_memory_remapping(dst_addr, 64);
+                remapped_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !remapped.load(std::sync::atomic::Ordering::SeqCst),
+                "overlapping remap proceeded during defer_host_read"
+            );
+            release_tx.send(()).unwrap();
+            remap.join().unwrap();
+            assert!(remapped.load(std::sync::atomic::Ordering::SeqCst));
+        });
+
+        let mut batch = super::Batch::default();
+        list.run_deferred(&mut batch);
+        waiter.join().unwrap();
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 0x5A);
+        list.close();
+        list.reset();
     }
 }
