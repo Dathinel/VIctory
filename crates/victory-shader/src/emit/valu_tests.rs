@@ -2207,6 +2207,57 @@ fn bcpack_bc7_precisions_match_the_formats_function() {
     });
 }
 
+/// `victory_formats::bcpack::pick` with its history length, the function the test below
+/// runs as console code.
+fn pick_reference<'a, T>(
+    i: usize,
+    r: usize,
+    history: &'a [T],
+    dictionary: &'a [T],
+    zero: &'a T,
+) -> &'a T {
+    const HISTORY: usize = 256;
+    match r {
+        0 => zero,
+        r if r <= i => &history[(i - r) % HISTORY],
+        r => &dictionary[r - i - 1],
+    }
+}
+
+/// BCPack's choice of a block's reference, written as console code, matches the formats
+/// crate's function on the GPU: none, a block of the history ring, or a dictionary entry
+/// before the first block, on both sides of each boundary.
+#[test]
+fn bcpack_reference_choice_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the block, v2 = its reference. The result names the source in its high half
+    // (1 the history, 2 the dictionary) and the entry in its low half.
+    body.extend(vop3(0x126, 5, vgpr(1), vgpr(2), 128)); // v_sub_nc_u32 v5, v1, v2
+    body.extend(vop3(0x148, 5, vgpr(5), 128, 128 + 8)); // v_bfe_u32 v5, v5, 0, 8
+    body.extend(vop3(0x36F, 5, 129, 128 + 16, vgpr(5))); // v_lshl_or_b32 v5, 1, 16, v5
+    body.extend(vop3(0x126, 6, vgpr(2), vgpr(1), 128)); // v_sub_nc_u32 v6, v2, v1
+    body.extend(vop3(0x125, 6, 193, vgpr(6), 128)); // v_add_nc_u32 v6, -1, v6
+    body.extend(vop3(0x36F, 6, 130, 128 + 16, vgpr(6))); // v_lshl_or_b32 v6, 2, 16, v6
+    body.extend(vop3(0x0C3, 106, vgpr(2), vgpr(1), 128)); // v_cmp_le_u32 vcc, v2, v1
+    body.extend(vop3(0x101, 7, vgpr(6), vgpr(5), vcc)); // v_cndmask_b32 v7, v6, v5, vcc
+    body.extend(vop3(0x0C2, 106, 128, vgpr(2), 128)); // v_cmp_eq_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 0, vgpr(7), 128, vcc)); // v_cndmask_b32 v0, v7, 0, vcc
+    let shader = build_valu_cs(&body);
+    // Entries that say where they are, so the function's choice reads as the result does.
+    let history: Vec<u32> = (0..256).map(|k| 1 << 16 | k).collect();
+    let dictionary: Vec<u32> = (0..255).map(|k| 2 << 16 | k).collect();
+    // Blocks and references on both sides of `r == 0`, `r == i` and the ring's length.
+    let cases: Vec<[u32; 4]> = [0u32, 1, 2, 254, 255, 256, 1000]
+        .into_iter()
+        .flat_map(|i| [0u32, 1, 2, 3, 128, 254, 255].map(|r| [i, r, 0, 0]))
+        .collect();
+    run_cases(&shader, &cases, |backend, _, [i, r, ..], got| {
+        let want = *pick_reference(i as usize, r as usize, &history, &dictionary, &0);
+        assert_eq!(got, want, "{backend}: pick(block {i}, reference {r})");
+    });
+}
+
 /// `victory_formats::bcpack::quads`, the function the test below runs as console code.
 fn quads_reference(rank: &[u8; 256], s: &[u8], ix: &mut [u8]) {
     for (q, &sym) in s.iter().enumerate() {
