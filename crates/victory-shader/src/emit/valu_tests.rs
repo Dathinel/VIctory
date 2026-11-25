@@ -270,15 +270,23 @@ fn run_cases_on(
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
+    let (mut ran, mut no_wave) = (0, 0);
     for &(label, warp) in backends {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(made) => made,
+            // The shader pins the console's wave size; a device without it
+            // cannot build the pipeline.
+            Err(e) if !super::lane_mask_tests::runs_wave32(&host) => {
+                eprintln!("{label} device has no 32-lane wave ({e}); skipped");
+                no_wave += 1;
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -304,7 +312,10 @@ fn run_cases_on(
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    assert!(
+        ran + no_wave > 0,
+        "neither hardware nor WARP SM 6.6 device available"
+    );
 }
 
 #[test]
