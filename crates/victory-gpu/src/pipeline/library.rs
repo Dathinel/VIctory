@@ -606,8 +606,11 @@ fn zeroed(n: usize) -> std::io::Result<Vec<u8>> {
 /// handle is held). Where a system refuses, the new library is left
 /// beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE))
-        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    // Publish through one name so a later load cannot promote an older save.
+    let next = dir.join(NEXT_FILE);
+    std::fs::rename(tmp, &next)?;
+    let _ = std::fs::rename(next, dir.join(LIBRARY_FILE));
+    Ok(())
 }
 
 /// Title pipelines created, and their distinct keys.
@@ -896,6 +899,46 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    #[test]
+    fn the_latest_saved_library_survives_reopening() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for keep_locked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let dir = dir.path();
+            let path = dir.join(LIBRARY_FILE);
+            let save = |byte| {
+                write_library(dir, 1, |out| {
+                    out[0] = byte;
+                    Ok(())
+                })
+                .unwrap();
+            };
+            save(1);
+            // Share reads only, forcing saves to retain the pending file.
+            let handle = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&path)
+                .unwrap();
+            let mut held = Some(handle);
+            save(2);
+            assert_eq!(std::fs::read(dir.join(NEXT_FILE)).unwrap(), [2]);
+            if !keep_locked {
+                drop(held.take());
+            }
+            save(3);
+            if keep_locked {
+                assert_eq!(std::fs::read(dir.join(NEXT_FILE)).unwrap(), [3]);
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), [3]);
+            }
+            drop(held);
+            assert_eq!(Blob::of(dir).bytes(), [3]);
+            assert!(!dir.join(NEXT_FILE).exists());
+        }
     }
 
     /// A mapped file reads as the file's bytes, a save writes the library
