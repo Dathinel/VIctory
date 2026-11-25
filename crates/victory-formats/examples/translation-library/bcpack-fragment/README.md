@@ -1,0 +1,9 @@
+# Decode a contiguous BCPack rANS payload
+
+Include `next-symbol.hlsli` next to the sibling `bcpack-rans` and `bcpack-bucket` directories. Pass the byte cursor, exclusive end, and persistent lane state. For a fresh fragment in the synthetic encoder format, the state begins at zero. The helper consumes bytes in forward order until it can decode a symbol. A false return means there is no symbol available from the current state and byte range. For complete, valid fragments from this encoder, verify that the final state is 2^24 and that the cursor reached the declared end. Device loads are aligned 32-bit reads; the containing buffer must be padded to a multiple of four bytes.
+
+This example starts after the fragment header. Each fixture starts with a fresh state. The project lane scheduler also handles retained state at fragment boundaries, reset flags and byte latching; these behaviors are outside this contiguous-payload helper. A false result alone does not validate a fragment. Use synthetic data from the Windows test runner. From this directory:
+
+    python verify.py PATH_TO_RUSTC PATH_TO_DXC PATH_TO_TEST_EXE FLAMINGO_CHECKOUT ../bcpack-bucket/bucket.hlsli ../bcpack-rans/decode-symbol.hlsli
+
+The driver compiles the unmodified fragment encoder from the pinned public Rust test. It supplies the symbol sequences, parses the two header lengths on the CPU and compares each decoded symbol, final state and byte count on hardware and WARP. The 260 fixtures cover all eight uniform model widths, all four start-byte alignments, empty fragments, and fragments up to 1024 symbols. The negative control discards the carried state only on subsequent symbol decodes. It must pass the empty and single-symbol fixtures and fail the larger batch. See the parent library README for building the synthetic GPU test runner.
