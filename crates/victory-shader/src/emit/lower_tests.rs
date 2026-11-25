@@ -366,6 +366,82 @@ fn pixel_sample_coverage_input_reads_dx_op_coverage() {
     assert!(!without.has_coverage_op);
 }
 
+/// VIC-BT-011: pixel survival follows the last `exp` with `vm`, and
+/// conditional non-`done` MRT writes are latched under EXEC instead of
+/// being refused or discarded on `done`'s guard alone.
+#[test]
+fn pixel_export_tracks_last_vm_and_masks_mrt_under_exec() {
+    use super::super::container::SigElement;
+    // v_cmp_eq_u32 vcc, 0, v0; s_and_saveexec_b32 s0, vcc_lo — narrow
+    // EXEC without a branch so the exports stay guarded in one block.
+    // exp mrt0 v0,v0,v0,v0 (no done, no vm) — previously "a conditional export".
+    // exp null done vm — last Valid Mask; survival uses this EXEC.
+    let words = [
+        0x7D84_0080u32, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE80_3C6A,    // s_and_saveexec_b32 s0, vcc_lo
+        0xF800_000F,
+        0,
+        0xF800_1890,
+        0,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            // No SPI inputs: v0 is not a barycentric, only a compare/export source.
+            input_addr: 0,
+            rsrc2: Default::default(),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    assert_eq!(io.exports.len(), 2);
+    assert!(!io.exports[0].done && !io.exports[0].vm);
+    assert!(io.exports[1].done && io.exports[1].vm);
+    assert!(
+        st.guards.iter().flatten().any(|g| g.is_some()),
+        "narrowed EXEC must guard the colour export"
+    );
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("conditional MRT + last-vm done must lower");
+    assert!(
+        lowered.has_discard_op,
+        "pixel exit must discard from the last Valid Mask"
+    );
+}
+
 #[test]
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the

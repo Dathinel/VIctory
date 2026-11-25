@@ -62,6 +62,9 @@ pub(crate) struct Lowered {
     /// Whether the program ballots active lanes (`waveActiveBallot`).
     #[cfg(test)]
     pub has_wave_ballot: bool,
+    /// Whether the program emits `dx.op.discard` (pixel survival).
+    #[cfg(test)]
+    pub has_discard_op: bool,
     /// Test builds: the `dx.op` calls before optimization, see
     /// [`Module::dx_op_calls`].
     #[cfg(test)]
@@ -288,6 +291,14 @@ struct Lower<'a> {
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
+    /// Per IR block: a `vm` export is behind every lane entering it.
+    vm_exported: Vec<bool>,
+    /// Per-lane Valid Mask SSA value while lowering a pixel block.
+    vm_live: Option<V>,
+    /// Phi of `vm_live` at the start of multi-predecessor pixel blocks.
+    vm_live_phis: Vec<Option<V>>,
+    /// `vm_live` leaving each IR block (pixel shaders).
+    vm_live_out: Vec<Option<V>>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
@@ -715,6 +726,10 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
+            vm_exported: vec![false; p.blocks.len()],
+            vm_live: None,
+            vm_live_phis: vec![None; p.blocks.len()],
+            vm_live_out: vec![None; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
@@ -1219,6 +1234,18 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+            self.vm_exported[b] =
+                !preds.is_empty() && preds.iter().all(|&q| self.vm_exported_out(q));
+            if self.s.pixel {
+                self.vm_live = Some(if preds.is_empty() {
+                    // Alive until the first Valid-Mask export.
+                    self.s.m.bool(true)
+                } else {
+                    let phi = self.s.m.phi(self.cur, self.s.t.i1);
+                    self.vm_live_phis[b] = Some(phi);
+                    phi
+                });
+            }
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
@@ -1250,6 +1277,9 @@ impl<'a> Lower<'a> {
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
+            if self.s.pixel {
+                self.vm_live_out[b] = self.vm_live;
+            }
             self.exit(b)?;
         }
         self.fill_phis()?;
@@ -1272,6 +1302,8 @@ impl<'a> Lower<'a> {
         let has_helper_lane_op = self.s.m.has_dx_op("dx.op.isHelperLane.i1", 221);
         #[cfg(test)]
         let has_wave_ballot = self.s.m.has_dx_op("dx.op.waveActiveBallot", 116);
+        #[cfg(test)]
+        let has_discard_op = self.s.m.has_dx_op("dx.op.discard", 82);
         #[cfg(test)]
         let dx_ops = self.s.m.dx_op_calls();
         Ok(Lowered {
@@ -1317,6 +1349,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             has_wave_ballot,
             #[cfg(test)]
+            has_discard_op,
+            #[cfg(test)]
             dx_ops,
         })
     }
@@ -1328,6 +1362,14 @@ impl<'a> Lower<'a> {
     fn has_done_export(&self, b: usize) -> bool {
         (0..self.x.p.blocks[b].insts.len())
             .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+    }
+
+    fn vm_exported_out(&self, b: usize) -> bool {
+        self.vm_exported[b] || self.has_vm_export(b)
+    }
+
+    fn has_vm_export(&self, b: usize) -> bool {
+        (0..self.x.p.blocks[b].insts.len()).any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.vm))
     }
 
     /// Values of the program's input registers.
@@ -9631,17 +9673,15 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
-        let c = self.cur;
-        if let Some(g) = guard
-            && !mesh
-        {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        // Pixel survival is the EXEC of the last `vm` export (not `done`).
+        if self.s.pixel && e.vm {
+            self.vm_live = Some(match guard {
+                Some(g) => g,
+                None => self.s.m.bool(true),
+            });
+        }
+        if guard.is_some() && !mesh && !self.s.pixel {
+            return Err("a conditional export");
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
@@ -9675,6 +9715,7 @@ impl<'a> Lower<'a> {
         }
         // A mesh lane writes its own vertex or primitive, where it exports;
         // guard against threads past the declared vertex/primitive maximum.
+        // Pixel colour / depth / stencil writes are last-write-masked by EXEC.
         let at = if mesh {
             let m = self.s.mesh.expect("mesh");
             let threads = self.s.threads.expect("mesh")[0];
@@ -9694,6 +9735,8 @@ impl<'a> Lower<'a> {
             } else {
                 guard
             };
+            self.begin_guarded(guard)
+        } else if self.s.pixel {
             self.begin_guarded(guard)
         } else {
             None
@@ -9922,11 +9965,26 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
-                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
-                    // A lane leaving without its final export was killed.
-                    let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                if self.s.pixel {
+                    // Last `vm` export's EXEC is the survival mask; paths that
+                    // never hit a Valid-Mask or `done` export were killed.
+                    if self.vm_exported[b] || self.has_vm_export(b) {
+                        let live = self.vm_live.expect("pixel vm_live");
+                        let t = self.s.m.bool(true);
+                        let kill = self.s.m.bin(self.cur, Bin::Xor, live, t);
+                        self.s.op(
+                            self.cur,
+                            "discard",
+                            Attr::NoUnwind,
+                            self.s.t.void,
+                            82,
+                            &[kill],
+                        );
+                    } else if !self.exported[b] && !self.has_done_export(b) {
+                        let t = self.s.m.bool(true);
+                        self.s
+                            .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                    }
                 }
                 Term::Ret
             }
@@ -10074,6 +10132,21 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        for (b, phi) in self.vm_live_phis.iter().enumerate() {
+            let Some(&phi) = phi.as_ref() else {
+                continue;
+            };
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let Some(qb) = self.tail[q] else {
+                    continue;
+                };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let live = self.vm_live_out[q].unwrap_or_else(|| self.s.m.bool(true));
+                incoming.push((live, qb));
+            }
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
