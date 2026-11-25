@@ -2008,6 +2008,63 @@ fn integer_vop3_clamp_saturates_add_and_sub() {
     }
 }
 
+/// `victory_gpu::resource::rebase_mip_range`, the function the test below runs as console
+/// code.
+fn rebase_mip_range_reference(most_detailed: u32, levels: u32, dropped: u32) -> (u32, u32) {
+    let first = most_detailed.saturating_sub(dropped);
+    if levels == u32::MAX {
+        return (first, levels);
+    }
+    let end = most_detailed.saturating_add(levels).saturating_sub(dropped);
+    (first, end.saturating_sub(first).max(1))
+}
+
+/// A view's mip range moved onto a host copy without the texture's top levels, written as
+/// console code with saturating adds and subtracts, matches the GPU crate's function on
+/// the GPU, at both ends of every operand.
+#[test]
+fn view_mip_range_rebase_matches_the_gpu_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the most detailed level, v2 = the level count, v3 = the levels dropped, v4 =
+    // which half of the answer. v5 = the first level, v7 = the count.
+    body.extend(vop3_clamp(0x126, 5, vgpr(1), vgpr(3), 0)); // v_sub_nc_u32 v5, v1, v3 clamp
+    body.extend(vop3_clamp(0x125, 6, vgpr(1), vgpr(2), 0)); // v_add_nc_u32 v6, v1, v2 clamp
+    body.extend(vop3_clamp(0x126, 6, vgpr(6), vgpr(3), 0)); // v_sub_nc_u32 v6, v6, v3 clamp
+    body.extend(vop3_clamp(0x126, 7, vgpr(6), vgpr(5), 0)); // v_sub_nc_u32 v7, v6, v5 clamp
+    body.extend(vop3(0x114, 7, vgpr(7), 129, 128)); // v_max_u32 v7, v7, 1
+    // A view of every level stays one.
+    body.extend(vop3(0x0C2, 106, 193, vgpr(2), 128)); // v_cmp_eq_u32 vcc, -1, v2
+    body.extend(vop3(0x101, 7, vgpr(7), vgpr(2), vcc)); // v_cndmask_b32 v7, v7, v2, vcc
+    body.extend(vop3(0x0C5, 106, 128, vgpr(4), 128)); // v_cmp_ne_u32 vcc, 0, v4
+    body.extend(vop3(0x101, 0, vgpr(5), vgpr(7), vcc)); // v_cndmask_b32 v0, v5, v7, vcc
+    let shader = build_valu_cs(&body);
+    let ends = [0u32, 1, 3, 10, u32::MAX - 1, u32::MAX];
+    let mut cases = Vec::new();
+    for most_detailed in ends {
+        for levels in ends {
+            for dropped in [0u32, 1, 4, 11, u32::MAX] {
+                cases.extend([
+                    [most_detailed, levels, dropped, 0],
+                    [most_detailed, levels, dropped, 1],
+                ]);
+            }
+        }
+    }
+    run_cases(
+        &shader,
+        &cases,
+        |backend, _, [most_detailed, levels, dropped, half], got| {
+            let (first, count) = rebase_mip_range_reference(most_detailed, levels, dropped);
+            let want = if half == 0 { first } else { count };
+            assert_eq!(
+                got, want,
+                "{backend}: rebase({most_detailed}, {levels}, {dropped}), half {half}"
+            );
+        },
+    );
+}
+
 /// `victory_formats::bcpack::zz`, the function the test below runs as console code.
 fn zz_reference(v: u8, bits: u32) -> u8 {
     let mask = ((1u32 << bits) - 1) as u8;
