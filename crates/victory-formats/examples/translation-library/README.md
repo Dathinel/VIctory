@@ -21,3 +21,4 @@ The synthetic-tests directory contains independent Rust fixture patches. Apply o
 - [Read a contiguous synthetic fragment](bcpack-fragment/README.md)
 - [Step one lane across a fragment boundary](bcpack-lane/README.md)
 - [Schedule multiple lanes and recover entropy records](bcpack-schedule/README.md)
+- [Decode a compressed stream into BC4 blocks](bc4-stream/README.md)
