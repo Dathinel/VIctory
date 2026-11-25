@@ -45,6 +45,9 @@ pub(crate) struct Lowered {
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
+    /// Whether a pixel helper lane's `v_readfirstlane` selects its own value.
+    #[cfg(test)]
+    pub has_helper_lane_op: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -1228,6 +1231,8 @@ impl<'a> Lower<'a> {
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
+        #[cfg(test)]
+        let has_helper_lane_op = self.s.m.has_dx_op("dx.op.isHelperLane.i1", 221);
         Ok(Lowered {
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
@@ -1262,6 +1267,8 @@ impl<'a> Lower<'a> {
             has_fcmp_uno,
             #[cfg(test)]
             has_coverage_op,
+            #[cfg(test)]
+            has_helper_lane_op,
         })
     }
 
@@ -2696,6 +2703,30 @@ impl<'a> Lower<'a> {
             r = self.s.m.select(c, is, read, r);
         }
         r
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane: draws of 0.3 to 1.3 s
+    /// each, then DEVICE_HUNG. With its own value a helper lane matches in
+    /// the first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -5774,6 +5805,7 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -9719,8 +9751,8 @@ mod tests {
         lowers(&mac, 0).expect("v_mac_f16");
     }
 
-    /// Lowers a pixel program with one target: whether it translates.
-    fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Lowers a pixel program with one target.
+    fn lower_ps_words(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Ps,
@@ -9763,7 +9795,34 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    /// Lowers a pixel program with one target: whether it translates.
+    fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_ps_words(words).map(|_| ())
+    }
+
+    /// A bare `v_readfirstlane_b32` in a pixel shader (not a proved waterfall
+    /// descriptor read) wraps `waveReadLaneFirst` so a helper lane keeps its
+    /// own value: `select(isHelperLane(), own, first)`. Compute is unchanged.
+    #[test]
+    fn pixel_readfirstlane_helper_lane_keeps_own_value() {
+        // v_readfirstlane_b32 s0, v0; v_mov_b32 v0, s0; exp mrt0 …; s_endpgm
+        let words = [0x7E00_0500, 0x7E00_0200, 0xF800_180F, 0, S_ENDPGM];
+        let ps = lower_ps_words(&words).expect("pixel readfirstlane");
+        assert!(ps.wave_ops);
+        assert!(
+            ps.has_helper_lane_op,
+            "pixel v_readfirstlane must emit dx.op.isHelperLane.i1"
+        );
+
+        // Same code as compute: no helpers, so no isHelperLane wrap.
+        let cs = lower_words(&words, 0).expect("compute readfirstlane");
+        assert!(cs.wave_ops);
+        assert!(
+            !cs.has_helper_lane_op,
+            "compute v_readfirstlane must stay bare waveReadLaneFirst"
+        );
     }
 
     /// Lowers a compute program of constants that allocates 512 bytes of LDS
