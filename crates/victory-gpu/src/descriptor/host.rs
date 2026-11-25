@@ -28,6 +28,10 @@ enum SlotRefresh {
     },
 }
 
+/// Title resource and host `(MostDetailedMip, MipLevels)` a slot's SRV was
+/// made with after resident-mip narrowing.
+type SrvMips = (usize, (u32, u32));
+
 /// Maximum number of recent texture-descriptor writes retained in
 /// [`TexTracker::changes`] for incremental bindless sync across `tex_gen`
 /// bumps; overflowing falls back to a full `live_textures` walk once.
@@ -162,6 +166,10 @@ pub(crate) struct HostHeap {
     /// Slots requiring submission-time title-memory refresh (aliased structured
     /// SRV shadows, or a view's own copy when off an element of its host copy).
     refreshes: Mutex<HashMap<u32, SlotRefresh>>,
+    /// Host SRV mip windows `(MostDetailedMip, MipLevels)` after narrowing to
+    /// resident levels, by slot. Used to remake the view when more streamed
+    /// mips arrive (#616).
+    srv_mips: Mutex<HashMap<u32, SrvMips>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -356,6 +364,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new((0..(count + extra)).map(|_| None).collect()),
             refreshes: Mutex::new(HashMap::new()),
+            srv_mips: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
         };
@@ -582,15 +591,28 @@ impl HostHeap {
 
     /// Slot `index` now views `kept` (or nothing of the host's).
     fn keep(&self, index: u32, kept: Kept) {
-        let (resource, refresh) = match kept {
-            Kept::Empty => (None, None),
+        let (resource, refresh, host_mips) = match kept {
+            Kept::Empty => (None, None, None),
             #[cfg(test)]
-            Kept::Resource(r) => (Some(KeptBacking::Resource { _resource: r }), None),
-            Kept::Shadow(s) => (Some(KeptBacking::Shadow { _shadow: s }), None),
+            Kept::Resource(r) => (Some(KeptBacking::Resource { _resource: r }), None, None),
+            Kept::Shadow(s) => (Some(KeptBacking::Shadow { _shadow: s }), None, None),
+            Kept::Texture {
+                resource,
+                title,
+                is_uav: false,
+                host_mips: Some(mips),
+            } => (
+                Some(KeptBacking::Resource {
+                    _resource: resource,
+                }),
+                None,
+                Some((title, mips)),
+            ),
             Kept::Texture { resource, .. } => (
                 Some(KeptBacking::Resource {
                     _resource: resource,
                 }),
+                None,
                 None,
             ),
             Kept::AliasedShadow {
@@ -606,6 +628,7 @@ impl HostHeap {
                     address,
                     len,
                 }),
+                None,
             ),
         };
         let old = {
@@ -618,6 +641,18 @@ impl HostHeap {
             // A running submission may still read the old resource through
             // this slot.
             crate::host::retire(old);
+        }
+        {
+            let mut map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
+            match host_mips {
+                Some(entry) => {
+                    map.insert(index, entry);
+                }
+                None if !map.is_empty() => {
+                    map.remove(&index);
+                }
+                None => {}
+            }
         }
         let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
         match refresh {
@@ -839,7 +874,16 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
+        // A streamed texture's host SRV may have been narrowed to the levels
+        // that had arrived; remake when more (or all) of them are there.
+        let widen = for_draw && !self.sampler && made[index as usize] == key && {
+            let map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&index) {
+                Some(&(title, host)) => residency_widened(&view, title, host),
+                None => false,
+            }
+        };
+        if made[index as usize] != key || widen {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -911,6 +955,37 @@ impl HostHeap {
             let handle = start + u64::from(index) * step;
             self.mirror(index, handle, for_draw);
             mirrored += 1;
+        }
+        mirrored
+    }
+
+    /// Remakes host SRVs that were narrowed to a streamed mip suffix once more
+    /// (or all) levels have arrived, even when the title descriptor itself did
+    /// not change — bindless ResourceHeap draws never walk tables, and
+    /// write-watch sync only remirrors dirty heap pages (#616).
+    pub(crate) fn remirror_widened_srvs(&self, start: u64, step: u64, for_draw: bool) -> usize {
+        if !for_draw || self.sampler || step == 0 {
+            return 0;
+        }
+        let candidates: Vec<(u32, SrvMips)> = {
+            let map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
+            map.iter()
+                .filter(|&(&index, _)| index < self.count)
+                .map(|(&index, &entry)| (index, entry))
+                .collect()
+        };
+        let mut mirrored = 0;
+        for (index, (title, host_mips)) in candidates {
+            let handle = start + u64::from(index) * step;
+            // SAFETY: slot index is below `self.count`; each descriptor is ≥16 bytes.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
+                continue;
+            };
+            if residency_widened(&view, title, host_mips) {
+                self.mirror(index, handle, for_draw);
+                mirrored += 1;
+            }
         }
         mirrored
     }
@@ -1119,6 +1194,169 @@ macro_rules! once {
     }};
 }
 
+/// Narrows a shader resource view of `texture` to the mips of `resource`
+/// whose memory is there: `MostDetailedMip` up to the most detailed resident
+/// one, `MipLevels` to what is left. Returns the mips the host view names,
+/// `None` if the view is left as the title asked (fully mapped, host-written,
+/// not a 2D view, or nothing known yet).
+fn narrow_to_resident(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+) -> Option<(u32, u32)> {
+    // A copy/resolve filled the host mip chain; title-memory residency is
+    // stale and must not clamp the view (#616).
+    if crate::texture::is_host_written(resource) {
+        return None;
+    }
+    // Prefer the window the last staging refresh noted; fall back to a live
+    // mapped-prefix query so the first view before any upload is still clamped.
+    let resident =
+        crate::texture::resident(resource).or_else(|| crate::texture::live_resident(resource))?;
+    if resident.1 == 0 {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    let asked = match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the dimension selects the Texture2D union member.
+            let t = unsafe { desc.Anonymous.Texture2D };
+            (t.MostDetailedMip, t.MipLevels)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the dimension selects the Texture2DArray union member.
+            let t = unsafe { desc.Anonymous.Texture2DArray };
+            (t.MostDetailedMip, t.MipLevels)
+        }
+        _ => return None,
+    };
+    let (first, count) = crate::texture::narrowed(asked, resident, mips);
+    let asked_levels = if asked.1 == 0 || asked.1 == u32::MAX {
+        mips.saturating_sub(asked.0)
+    } else {
+        asked.1
+    };
+    if (first, count) == (asked.0, asked_levels) {
+        return None;
+    }
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: as above.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            *t = D3D12_TEX2D_SRV {
+                MostDetailedMip: first,
+                MipLevels: count,
+                PlaneSlice: t.PlaneSlice,
+                ResourceMinLODClamp: t.ResourceMinLODClamp,
+            };
+        }
+        _ => {
+            // SAFETY: as above.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            *t = D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: first,
+                MipLevels: count,
+                FirstArraySlice: t.FirstArraySlice,
+                ArraySize: t.ArraySize,
+                PlaneSlice: t.PlaneSlice,
+                ResourceMinLODClamp: t.ResourceMinLODClamp,
+            };
+        }
+    }
+    Some((first, count))
+}
+
+/// Whether a host SRV made with `host_mips` for title view `view` should be
+/// remade because more (or all) streamed levels have arrived.
+fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
+    let Some(texture) = crate::resource::host_resource(title as crate::object::This) else {
+        return false;
+    };
+    // SAFETY: a live resource when this slot still holds it.
+    let rd = unsafe { texture.GetDesc() };
+    let mips = u32::from(rd.MipLevels);
+    let asked = match view {
+        View::Shader(_, Some(w)) => match asked_srv_mips(&srv_desc(w), mips) {
+            Some(a) => a,
+            None => return false,
+        },
+        View::Placed(false, _, desc) => {
+            let words: [u32; 10] = match desc[..10].try_into() {
+                Ok(w) => w,
+                Err(_) => return false,
+            };
+            match asked_srv_mips(&srv_desc(&words), mips) {
+                Some(a) => a,
+                None => return false,
+            }
+        }
+        // Typeless default SRVs synthesize a concrete desc at make time; rebuild
+        // that same asked window so a later widen can remake them (#616).
+        View::Shader(_, None) => {
+            let own = rd.Format.0 as u32;
+            if !is_typeless(own) {
+                return false;
+            }
+            let Some(fmt) = concrete_format_for(title as crate::object::This, own, false) else {
+                return false;
+            };
+            let Some(desc) = default_srv_desc(&rd, fmt) else {
+                return false;
+            };
+            match asked_srv_mips(&desc, mips) {
+                Some(a) => a,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    let want = if crate::texture::is_host_written(title as crate::object::This) {
+        // Host copy owns the full chain; restore the title's asked range.
+        if host_mips != asked {
+            asked
+        } else {
+            return false;
+        }
+    } else {
+        match crate::texture::resident(title as crate::object::This) {
+            Some(window) if window.1 > 0 => crate::texture::narrowed(asked, window, mips),
+            // Fully mapped (or no longer tracked as partial): the title's range.
+            _ if host_mips != asked => asked,
+            _ => return false,
+        }
+    };
+    want != host_mips
+}
+
+/// `(MostDetailedMip, MipLevels)` a 2D / 2D-array SRV asks for, with `0` /
+/// [`u32::MAX`] levels expanded against the resource mip count.
+fn asked_srv_mips(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, mips: u32) -> Option<(u32, u32)> {
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: Texture2D member.
+            let t = unsafe { desc.Anonymous.Texture2D };
+            let levels = if t.MipLevels == 0 || t.MipLevels == u32::MAX {
+                mips.saturating_sub(t.MostDetailedMip)
+            } else {
+                t.MipLevels
+            };
+            Some((t.MostDetailedMip, levels))
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: Texture2DArray member.
+            let t = unsafe { desc.Anonymous.Texture2DArray };
+            let levels = if t.MipLevels == 0 || t.MipLevels == u32::MAX {
+                mips.saturating_sub(t.MostDetailedMip)
+            } else {
+                t.MipLevels
+            };
+            Some((t.MostDetailedMip, levels))
+        }
+        _ => None,
+    }
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -1270,11 +1508,14 @@ enum Kept {
     Shadow(Arc<Shadow>),
     /// A host texture SRV or UAV, carrying the title `Resource` address and
     /// access kind so [`HostHeap::mirror`] can track it without re-reading the
-    /// title pointer after `make`.
+    /// title pointer after `make`. `host_mips` is the `(MostDetailedMip,
+    /// MipLevels)` the host SRV was made with (`None` for UAVs), so a later
+    /// mirror can remake it when more streamed levels arrive.
     Texture {
         resource: ID3D12Resource,
         title: usize,
         is_uav: bool,
+        host_mips: Option<(u32, u32)>,
     },
     AliasedShadow {
         shadow: Arc<Shadow>,
@@ -1622,65 +1863,35 @@ fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
 /// multi-plane, block-compressed, and 96-bit `R32G32B32` formats only allow
 /// shader views (`None` for UAVs); every typed UAV format is gated on the host
 /// device's cached `D3D12_FEATURE_FORMAT_SUPPORT` query.
+///
+/// Production null/UNKNOWN resolution goes through [`concrete_format_for`]
+/// (and `null_view_format`); this helper is the direct typeless-family table
+/// used by the unit tests below.
+#[cfg(test)]
 fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
-    let concrete = match DXGI_FORMAT(typeless as i32) {
-        // Depth-stencil multi-plane (SRV only, plane 0)
-        DXGI_FORMAT_R24G8_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R24_UNORM_X8_TYPELESS)?,
-        DXGI_FORMAT_R32G8X24_TYPELESS => {
-            (!unordered).then_some(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)?
-        }
-        // Block-compressed (SRV only)
-        DXGI_FORMAT_BC1_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC1_UNORM)?,
-        DXGI_FORMAT_BC2_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC2_UNORM)?,
-        DXGI_FORMAT_BC3_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC3_UNORM)?,
-        DXGI_FORMAT_BC4_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC4_UNORM)?,
-        DXGI_FORMAT_BC5_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC5_UNORM)?,
-        DXGI_FORMAT_BC6H_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC6H_UF16)?,
-        DXGI_FORMAT_BC7_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC7_UNORM)?,
-        // 96-bit RGB has no typed UAV in D3D12 (SRV only)
-        DXGI_FORMAT_R32G32B32_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R32G32B32_FLOAT)?,
-        // Color (SRV, and UAV when supported by the host device)
-        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
-        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
-        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
-        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
-        DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
-        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
-        DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
-        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
-        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
-        _ => return None,
-    };
-    if unordered && !supports_typed_uav(concrete) {
+    let concrete = crate::resource::typeless_default_format(typeless, unordered)?;
+    if unordered && !supports_typed_uav(DXGI_FORMAT(concrete as i32)) {
         return None;
     }
-    Some(concrete.0 as u32)
+    Some(concrete)
 }
 
-/// Resolves the concrete view format for a typeless host texture: preserves the
-/// title's format for sRGB+UAV SRVs (via `view_format`, excluding depth formats
-/// other than mapping `D16_UNORM` to `R16_UNORM`), otherwise uses
-/// [`default_concrete_format`].
+/// Resolves the concrete view format for a typeless host texture when the title
+/// passed a null description or `DXGI_FORMAT_UNKNOWN`: uses [`view_format`] for
+/// textures promoted from a typed console format (sRGB kept on SRVs, mapped to
+/// linear on UAVs; depth mapped to an SRV plane format), else
+/// [`default_concrete_format`]. (#438 VIC-BT-004)
 fn concrete_format_for(
     resource: crate::object::This,
     own: u32,
     unordered: bool,
 ) -> Option<DXGI_FORMAT> {
-    if !unordered && let Some(fmt) = crate::resource::view_format(resource) {
-        if fmt == DXGI_FORMAT_D16_UNORM.0 as u32 {
-            return Some(DXGI_FORMAT_R16_UNORM);
-        }
-        if !crate::resource::DEPTH_FORMATS
-            .iter()
-            .any(|&(d, _)| d == fmt)
-        {
-            return Some(DXGI_FORMAT(fmt as i32));
-        }
+    let title = crate::resource::view_format(resource);
+    let concrete = crate::resource::null_view_format(own, title, unordered)?;
+    if unordered && !supports_typed_uav(DXGI_FORMAT(concrete as i32)) {
+        return None;
     }
-    default_concrete_format(own, unordered).map(|f| DXGI_FORMAT(f as i32))
+    Some(DXGI_FORMAT(concrete as i32))
 }
 
 /// Synthesizes a full SRV description matching `rd` with concrete `format` when
@@ -1841,6 +2052,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Typeless host copies need an explicit concrete format: `make` fills
+    // null / UNKNOWN via `concrete_format_for` before calling here (VIC-BT-004).
     if view == 0 {
         return !typeless;
     }
@@ -1916,6 +2129,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                // A texture only part of which is mapped (streaming in):
+                // sample the mips that are there, not the zeros of the ones
+                // that are not. The console streams a texture's mips into
+                // place and clamps the level of detail to what arrived; the
+                // host has no clamp but the view's window. Remember the
+                // narrowed window so a later mirror can widen it.
+                let host_mips = desc
+                    .as_mut()
+                    .and_then(|d| narrow_to_resident(resource, texture, d));
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -1928,6 +2150,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     resource: texture.clone(),
                     title: resource as usize,
                     is_uav: false,
+                    host_mips,
                 })
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -1979,6 +2202,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 resource: texture.clone(),
                 title: resource as usize,
                 is_uav: true,
+                host_mips: None,
             })
         }
         View::Sampler(words) => {

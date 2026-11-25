@@ -822,9 +822,12 @@ const RECT_ARGS_MIN: u64 = 64 << 10;
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
-    /// buffer copies, which later refreshes must see.
+    /// buffer copies, which later refreshes must see. Runs with
+    /// `title_dst = true` so unmapped title pages keep the commitment guard.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
+    /// A copy of title memory into the list's own upload memory. Runs with
+    /// `title_dst = false`: the destination is host-mapped, so Wine/vkd3d
+    /// `VirtualQuery` quirks must not skip it (#518).
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
@@ -1071,92 +1074,114 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         {
             #[cfg(test)]
             let _scope = enter_retire_scope(exec_scope.clone());
             for list in runs {
                 list.run_deferred(&mut batch);
-                firsts.push(lists.len());
-                if let Some(prelude) = list.prelude() {
-                    lists.push(Some(prelude));
-                }
-                lists.push(list.list.cast().ok());
             }
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                match self.queue.Signal(&self.fence, *submitted) {
-                    Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            let waited = WaitForSingleObject(self.event, INFINITE);
-                            if waited != WAIT_OBJECT_0 {
+        // Each HostList owns one reusable prelude allocator/list. A submission
+        // may name the same list twice (queue segments, re-executes); calling
+        // prelude() again would Reset that allocator while the first recording
+        // is still queued. Split into batches where each pointer appears once,
+        // waiting between batches so the prelude can be re-recorded safely
+        // (VIC-BT-001 / #440).
+        let ptrs: Vec<usize> = runs
+            .iter()
+            .map(|list| std::ptr::from_ref(*list) as usize)
+            .collect();
+        for range in unique_list_batches(&ptrs) {
+            let batch_runs = &runs[range];
+            let mut lists: Vec<Option<ID3D12CommandList>> =
+                Vec::with_capacity(2 * batch_runs.len());
+            // Where each run's lists start in `lists`.
+            let mut firsts = Vec::with_capacity(batch_runs.len());
+            {
+                #[cfg(test)]
+                let _scope = enter_retire_scope(exec_scope.clone());
+                for list in batch_runs {
+                    firsts.push(lists.len());
+                    if let Some(prelude) = list.prelude() {
+                        lists.push(Some(prelude));
+                    }
+                    lists.push(list.list.cast().ok());
+                }
+            }
+            // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+            #[cfg(feature = "diagnostics")]
+            let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+                firsts
+                    .iter()
+                    .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                    .map(|(&a, &b)| &lists[a..b])
+                    .collect()
+            } else {
+                vec![&lists[..]]
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let groups = [&lists[..]];
+            for (i, group) in groups.iter().enumerate() {
+                *submitted += 1;
+                let started = std::time::Instant::now();
+                // SAFETY: closed lists; the fence and event are ours. Prior
+                // batches have been waited for, so any reused prelude
+                // allocator is idle before the Reset inside prelude().
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    match self.queue.Signal(&self.fence, *submitted) {
+                        Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                            Ok(()) => {
+                                let waited = WaitForSingleObject(self.event, INFINITE);
+                                if waited != WAIT_OBJECT_0 {
+                                    tracing::warn!(
+                                        wait = waited.0,
+                                        "host fence event wait failed; polling fence"
+                                    );
+                                    self.poll_fence(*submitted);
+                                }
+                            }
+                            Err(e) => {
                                 tracing::warn!(
-                                    wait = waited.0,
-                                    "host fence event wait failed; polling fence"
+                                    error = %e,
+                                    "host fence event registration failed; polling fence"
                                 );
                                 self.poll_fence(*submitted);
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "host fence event registration failed; polling fence"
-                            );
-                            self.poll_fence(*submitted);
-                        }
-                    },
-                    Err(e) => fail(format_args!(
-                        "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
-                        runs.len(),
-                        self.removal_data(runs),
-                        last_notes(runs)
-                    )),
+                        },
+                        Err(e) => fail(format_args!(
+                            "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
+                            runs.len(),
+                            self.removal_data(runs),
+                            last_notes(runs)
+                        )),
+                    }
                 }
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i]
-                    .notes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len();
-                tracing::warn!(
-                    ms = started.elapsed().as_millis(),
-                    commands,
-                    "slow host list"
-                );
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let commands = batch_runs[i]
+                        .notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    tracing::warn!(
+                        ms = started.elapsed().as_millis(),
+                        commands,
+                        "slow host list"
+                    );
+                    for (ms, op) in batch_runs[i].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
+                let _ = (i, started);
             }
-            let _ = (i, started);
+            let _ = &firsts;
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1230,7 +1255,30 @@ impl Host {
         release_epoch_in(exec_state, exec_epoch);
         woken.run();
     }
+}
 
+/// Index ranges into a submission where each `HostList` pointer appears at
+/// most once. Used so [`HostList::prelude`] is never reset while a prior
+/// recording of the same list is still queued for `ExecuteCommandLists`.
+fn unique_list_batches(ptrs: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut seen = std::collections::HashSet::new();
+    for (i, &ptr) in ptrs.iter().enumerate() {
+        if !seen.insert(ptr) {
+            batches.push(start..i);
+            seen.clear();
+            seen.insert(ptr);
+            start = i;
+        }
+    }
+    if start < ptrs.len() {
+        batches.push(start..ptrs.len());
+    }
+    batches
+}
+
+impl Host {
     /// Fallback completion wait when registering or waiting on `self.event`
     /// fails after `self.queue.Signal(&self.fence, target)` succeeded, so
     /// copy-back, writes, and epoch retirement never run while the GPU may
@@ -1963,7 +2011,13 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Copies `len` bytes from `src` to `dst` when the list is submitted.
+    /// Copies `len` bytes from `src` to title memory at `dst` when the list
+    /// is submitted (`Step::Copy` → `copy_mapped(..., title_dst = true)`).
+    ///
+    /// Title destinations keep the `VirtualQuery` commitment guard. Host-owned
+    /// mapped upload memory must use [`Self::defer_fill`] instead: under
+    /// Wine+vkd3d, `Map` pointers can report as `MEM_FREE` and the guard would
+    /// skip the copy (#518).
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.mark_work();
         let mut deferred = self.deferred();
@@ -1982,8 +2036,12 @@ impl HostList {
         self.deferred().copy_gen
     }
 
-    /// Copies `len` bytes of title memory at `src` into the list's upload
-    /// memory at `dst` when the list is submitted.
+    /// Copies `len` bytes of title memory at `src` into host-owned upload
+    /// memory at `dst` when the list is submitted (`Step::Fill` →
+    /// `copy_mapped(..., title_dst = false)`).
+    ///
+    /// Buffer→texture staging in `copy_texture_region` uses this; buffer→buffer
+    /// title copies stay on [`Self::defer_copy`].
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.mark_work();
         self.deferred()
@@ -2444,6 +2502,12 @@ impl Batch {
 /// destination (`title_dst`) that is not all mapped takes nothing from its
 /// first unmapped page on.
 ///
+/// Host-owned staging uploads pass `title_dst = false` (`Step::Fill` /
+/// [`HostList::defer_fill`]): those destinations are known mapped, and under
+/// Wine+vkd3d `VirtualQuery` can report them as `MEM_FREE`, so the commitment
+/// guard must not apply (#518). Title buffer destinations keep `title_dst =
+/// true` (`Step::Copy` / [`HostList::defer_copy`]).
+///
 /// The copy runs in the kernel (`ReadProcessMemory`), which reports an
 /// unmapped page of the source, or of the destination it writes, instead of
 /// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
@@ -2778,6 +2842,25 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    /// Host-owned staging (`title_dst = false`, `defer_fill`) still copies;
+    /// title destinations (`title_dst = true`, `defer_copy`) keep the
+    /// commitment guard. Wine+vkd3d can report Map memory as MEM_FREE, which
+    /// is why buffer→texture staging must not use the title path (#518).
+    #[test]
+    fn host_staging_fill_copies_while_title_dst_keeps_the_commitment_guard() {
+        let from = pattern();
+        // Fill path: a heap buffer stands in for mapped upload memory.
+        let mut staging = vec![0u8; BLOCK];
+        copy_mapped(staging.as_mut_ptr(), from.as_ptr(), BLOCK, false);
+        assert_eq!(&staging[..], &from[..BLOCK]);
+        // Copy path: an unmapped hole in the title destination stops the
+        // write; the trailing committed block stays untouched.
+        let title = holed(0xee);
+        copy_mapped(title, from.as_ptr(), 3 * BLOCK, true);
+        assert!(block(title, 2).iter().all(|&b| b == 0xee));
+        release(title);
     }
 
     // Run on both revisions with --ignored --nocapture to measure the active path.
@@ -4103,6 +4186,118 @@ mod tests {
         host.execute(&[]);
         let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(before, after, "empty execute must not bump the fence");
+    }
+
+    #[test]
+    fn unique_list_batches_splits_on_repeated_pointers() {
+        assert!(unique_list_batches(&[]).is_empty());
+        assert_eq!(unique_list_batches(&[1]), vec![0..1]);
+        assert_eq!(unique_list_batches(&[1, 2, 3]), vec![0..3]);
+        assert_eq!(unique_list_batches(&[1, 1]), vec![0..1, 1..2]);
+        assert_eq!(unique_list_batches(&[1, 2, 1]), vec![0..2, 2..3]);
+        assert_eq!(unique_list_batches(&[1, 2, 1, 2]), vec![0..2, 2..4]);
+        assert_eq!(unique_list_batches(&[7, 7, 7]), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn duplicate_list_execute_splits_submissions() {
+        // VIC-BT-001: the same HostList twice must not Reset its prelude
+        // allocator while the first recording is still queued. Exact batch
+        // counts are covered by `unique_list_batches` (process-wide
+        // `submitted` races with parallel GPU tests).
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        list.close();
+        let other = host.new_list().expect("other list");
+        other.close();
+
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[&list]);
+        let after_one = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after_one > before,
+            "one list must wait at least one submission"
+        );
+
+        host.execute(&[&list, &other]);
+        let after_unique = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after_unique > after_one,
+            "two distinct lists must submit at least once"
+        );
+
+        host.execute(&[&list, &list]);
+        let after_dup = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after_dup > after_unique,
+            "a repeated HostList must submit again (separate waited batches)"
+        );
+        // SAFETY: plain device-removed query after the duplicate submission.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn duplicate_list_execute_preserves_texture_state() {
+        // Synthetic reproducer from VIC-BT-001: list L transitions a texture
+        // (first != last). Submitting [L, L] must leave host state at `last`
+        // and must not remove the device from a clobbered prelude barrier.
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        const COPY_DEST: u32 = 0x400;
+        const RENDER_TARGET: u32 = 0x4;
+        // Record real barriers so prelude first/last states match the GPU list.
+        crate::list::ensure_state(&list, tex, COPY_DEST);
+        crate::list::ensure_state(&list, tex, RENDER_TARGET);
+        list.close();
+
+        host.execute(&[&list, &list]);
+
+        let copy = crate::resource::host_copy(tex).expect("host copy");
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            RENDER_TARGET,
+            "duplicate execute must leave the texture at the list's end state"
+        );
+        // SAFETY: plain device-removed query after prelude barriers ran twice.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]

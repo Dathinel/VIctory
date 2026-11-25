@@ -82,9 +82,18 @@ impl<'a> Container<'a> {
         if count > MAX_PARTS {
             return Err(ShaderError::Malformed("implausible part count"));
         }
+        let table_end = HEADER_SIZE + 4 * count;
+        if table_end > data.len() {
+            return Err(ShaderError::Malformed("part table out of bounds"));
+        }
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
+            if offset < table_end {
+                return Err(ShaderError::Malformed(
+                    "part starts inside the header or part table",
+                ));
+            }
             let fourcc = FourCC(
                 data.get(offset..offset + 4)
                     .ok_or(ShaderError::Malformed("part header out of bounds"))?
@@ -487,5 +496,30 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_parts_starting_inside_the_header_or_table() {
+        let mut bytes = build(&[(FourCC([0; 4]), &[]), (FourCC::HASH, &[])]);
+        let second_entry = HEADER_SIZE + 4;
+        // A zero digest and a zero first FourCC make both bogus sizes zero,
+        // so a part at any offset in the header reads back as "valid".
+        for offset in [0u32, second_entry as u32] {
+            bytes[second_entry..second_entry + 4].copy_from_slice(&offset.to_le_bytes());
+            assert_eq!(
+                Container::parse(&bytes).unwrap_err(),
+                ShaderError::Malformed("part starts inside the header or part table"),
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_part_table_longer_than_the_container() {
+        let mut bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4])]);
+        bytes[0x1C..0x20].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part table out of bounds"),
+        );
     }
 }

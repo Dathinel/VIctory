@@ -23,8 +23,10 @@
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
-//!   immediate sampler it uses has a comparison filter there (bit 0x80);
-//!   a heap sampler it uses must be a comparison sampler on the host.
+//!   immediate sampler used for comparison has a comparison filter there
+//!   (bit 0x80); the same console words used both ways get two slots so
+//!   annotateHandle matches `dx.resources`. A heap sampler used for
+//!   comparison must be a comparison sampler on the host.
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
@@ -83,6 +85,8 @@ mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod half_src_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
@@ -90,6 +94,8 @@ mod lane_mask_tests;
 #[cfg(test)]
 mod lds_tests;
 mod lower;
+#[cfg(test)]
+mod mad_flush_tests;
 #[cfg(test)]
 mod mtbuf_tests;
 mod rect;

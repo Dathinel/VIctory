@@ -47,6 +47,9 @@ pub(crate) struct Staging {
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
+    /// Title resource this staging buffer is of: host SRVs are narrowed to
+    /// its resident mip window ([`note_resident`]).
+    resource: This,
     last: Mutex<Last>,
 }
 
@@ -80,9 +83,24 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    {
+        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        set.get_or_insert_with(Default::default)
+            .insert(resource as usize);
+    }
+    // The host mip chain is complete; drop any CPU-streamed resident window
+    // so narrowed SRVs remake to the title's full range (#616).
+    note_resident(resource, None);
+}
+
+/// Whether the host GPU wrote `resource` (copy/resolve), so its contents are
+/// on the host rather than in title memory.
+pub(crate) fn is_host_written(resource: This) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
 }
 
 /// The buffer a texture the host writes is copied through into the texture
@@ -301,6 +319,7 @@ pub(crate) fn forget(resource: usize) {
             set.remove(&resource);
         }
     }
+    note_resident(resource as This, None);
     if let Some(staging) = staging {
         crate::host::retire(staging);
     }
@@ -424,6 +443,8 @@ impl Staging {
             }
             last.asked = now;
             last.hash = None;
+            // Write-watched pools are mapped for the whole texture.
+            note_resident(self.resource, None);
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
@@ -442,11 +463,17 @@ impl Staging {
             let first =
                 (self.first..end).find(|&mip| self.layout.bytes_from(mip) <= resident as u64);
             let bytes = first.map_or(0, |mip| self.layout.bytes_from(mip) as usize);
+            // Host SRVs of this texture are narrowed to the same suffix.
+            let window = first.map(|mip| (mip, end - mip));
+            note_resident(self.resource, window);
             with_tiled_copy(self.memory, bytes, |tiled| {
                 self.changed(last, tiled, first.unwrap_or(end));
             });
             return bytes;
         }
+        // All of it is there (or the layout has no separable mip suffix):
+        // host views keep the title's full mip window.
+        note_resident(self.resource, None);
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
@@ -559,6 +586,48 @@ fn committed_prefix(at: *const u8, len: usize) -> usize {
     p.min(end) - at as usize
 }
 
+/// Narrows a title view's mip window to the resident ones; see
+/// [`victory_formats::texture::narrowed_view`].
+pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u32, u32) {
+    victory_formats::texture::narrowed_view(asked, resident, mips)
+}
+
+/// Last-known resident mip window of a title texture, set by its staging
+/// refresh. `None` while it is fully mapped (or never partly streamed).
+pub(crate) fn resident(resource: This) -> Option<(u32, u32)> {
+    let map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&(resource as usize)).copied()
+}
+
+/// Notes the resident mip window of `resource` (`None` when fully mapped).
+/// Host SRVs are narrowed to it while it stands and remade when it widens.
+pub(crate) fn note_resident(resource: This, window: Option<(u32, u32)>) {
+    let mut map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    match window {
+        Some(w) => {
+            map.insert(resource as usize, w);
+        }
+        None => {
+            map.remove(&(resource as usize));
+        }
+    }
+}
+
+/// Live resident mip window of `resource` from its mapped prefix, for the
+/// first host view before a staging refresh has noted one. `None` when fully
+/// mapped or the layout cannot express a mip suffix.
+pub(crate) fn live_resident(resource: This) -> Option<(u32, u32)> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?.planes[0]
+        .layout
+        .clone();
+    let committed = committed_prefix(memory, layout.size as usize);
+    layout.resident_from_prefix(committed)
+}
+
+static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<Arc<Staging>> {
     let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -635,6 +704,7 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
         layout,
         mips: u32::from(d.MipLevels),
         memory,
+        resource,
         last: Mutex::default(),
     });
     map.entry(resource as usize).or_default().push(s.clone());
@@ -1290,5 +1360,33 @@ void read(uint3 id : SV_DispatchThreadID) {
             std::array::from_fn(|i| 0x3F00_0000 | ((i as u32 + 1) * 0x1357));
         assert_eq!(got, expected);
         list.reset();
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::{forget, host_written, is_host_written, note_resident, resident};
+
+    #[test]
+    fn noted_resident_window_updates_when_more_arrive() {
+        let resource = 0x616u64 as _;
+        note_resident(resource, Some((5, 4)));
+        assert_eq!(resident(resource), Some((5, 4)));
+        note_resident(resource, Some((2, 7)));
+        assert_eq!(resident(resource), Some((2, 7)));
+        note_resident(resource, None);
+        assert_eq!(resident(resource), None);
+    }
+
+    #[test]
+    fn host_written_clears_resident_window() {
+        let resource = 0x617u64 as _;
+        note_resident(resource, Some((3, 5)));
+        assert_eq!(resident(resource), Some((3, 5)));
+        host_written(resource);
+        assert!(is_host_written(resource));
+        assert_eq!(resident(resource), None);
+        // Leave no cross-test residue in the process-wide sets.
+        forget(resource as usize);
     }
 }
