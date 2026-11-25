@@ -57,12 +57,85 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Why no presenter was made (or resized), and when to try again: a run
+    /// with no desktop to present on would otherwise ask DXGI at the frame
+    /// rate.
+    present_retry: Mutex<Retry>,
     /// Detached host lists whose submissions finished, ready to reuse.
     free_lists: Mutex<Vec<HostList>>,
     #[cfg(test)]
     reused_lists: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     d3d12_errors: std::sync::atomic::AtomicU64,
+}
+
+/// A presenter that could not be made, and when to try again. Without this,
+/// a run behind a locked screen or a sleeping display retried every frame:
+/// 1,654 `no swap chain` lines in 60 seconds, and one DXGI call per frame,
+/// which buries the log and costs a submission's worth of work each time.
+struct Retry {
+    attempts: u32,
+    /// The next attempt is due at (or after) this instant; `None` with
+    /// `attempts == 0` means nothing has failed.
+    next: Option<std::time::Instant>,
+}
+
+impl Retry {
+    const fn new() -> Self {
+        Retry {
+            attempts: 0,
+            next: None,
+        }
+    }
+
+    /// Whether an attempt is due at `now`.
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.next.is_none_or(|at| now >= at)
+    }
+
+    /// Records a failed attempt at `now` and when the next one may run.
+    fn failed(&mut self, now: std::time::Instant) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.next = Some(now + retry_delay(self.attempts));
+    }
+
+    /// Clears the failure state after an attempt worked, returning how many
+    /// attempts had failed before it.
+    fn reset(&mut self) -> u32 {
+        let attempts = self.attempts;
+        *self = Retry::new();
+        attempts
+    }
+}
+
+/// How long to wait before retry number `attempts`: 100 ms, doubling, up to
+/// one second, so a state that clears still recovers within a second.
+fn retry_delay(attempts: u32) -> std::time::Duration {
+    const FIRST_MS: u64 = 100;
+    const MOST_MS: u64 = 1_000;
+    let doubling = FIRST_MS << attempts.saturating_sub(1).min(4);
+    std::time::Duration::from_millis(doubling.min(MOST_MS))
+}
+
+/// Which step of making a presenter failed, so the log says whether the
+/// window, the swap chain or its command list was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentStep {
+    Window,
+    Factory,
+    SwapChain,
+    List,
+}
+
+impl PresentStep {
+    fn name(self) -> &'static str {
+        match self {
+            PresentStep::Window => "window",
+            PresentStep::Factory => "DXGI factory",
+            PresentStep::SwapChain => "swap chain",
+            PresentStep::List => "copy list",
+        }
+    }
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -454,6 +527,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            present_retry: Mutex::new(Retry::new()),
             free_lists: Mutex::default(),
             #[cfg(test)]
             reused_lists: std::sync::atomic::AtomicU64::new(0),
@@ -810,16 +884,6 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
-impl Deferred {
-    /// Whether a fill of upload memory at `dst` from title memory at `src`
-    /// (`len` bytes) is not yet among the steps since the last title copy
-    /// (and notes it). Kept with the refreshed ranges: both are forgotten
-    /// when a title copy may have changed their source.
-    fn first_fill(&mut self, dst: usize, src: usize, len: usize) -> bool {
-        self.refreshed.insert((dst, src, len))
-    }
-}
-
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -986,6 +1050,11 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // D3D12 requires NumCommandLists >= 1; an empty submission is a no-op
+        // (VIC-BT-035 / #440).
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1922,26 +1991,6 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
-    /// Copies `len` bytes of title memory at `src` into `dst` (mapped inside
-    /// `upload`) when the list is submitted, keeping `upload` alive until the
-    /// list is reset.
-    pub(crate) fn defer_fill_upload(
-        &self,
-        upload: ID3D12Resource,
-        dst: *mut u8,
-        src: *const u8,
-        len: usize,
-    ) {
-        self.mark_work();
-        let mut d = self.deferred();
-        // Every draw or dispatch that binds the slot asks; until a title
-        // copy intervenes another fill would copy the same bytes again.
-        if d.first_fill(dst as usize, src as usize, len) {
-            d.uploads.push(upload);
-            d.copies.push(Step::Fill(dst as usize, src as usize, len));
-        }
-    }
-
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -2377,6 +2426,11 @@ impl Batch {
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
+            if let Some(bytes) = crate::shadow::skipped(to - from, copied) {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, bytes);
+            }
+            #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -2527,24 +2581,30 @@ pub fn write_title_memory(destination: usize, bytes: &[u8]) -> bool {
     written
 }
 
-/// `NtWriteVirtualMemory`, looked up once. `WriteProcessMemory` asks the
-/// kernel about the destination's region first (to flush the instruction
-/// cache of executable memory), which in the title's big pools walks page
-/// tables for about 2 ms a call: the copy back after a world submission
-/// spent over a second there. The system call itself writes the same bytes
-/// and reports a page it cannot write the same way.
-fn nt_write_virtual_memory() -> Option<NtWrite> {
+#[derive(Clone, Copy)]
+enum CopyBack {
+    WineRead,
+    NativeWrite(NtWrite),
+}
+
+/// Select the checked same-process copy once. Proton's read path is much
+/// cheaper for the small rows and pages written back after a submission.
+fn copy_back_method() -> Option<CopyBack> {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-    static CALL: std::sync::OnceLock<Option<NtWrite>> = std::sync::OnceLock::new();
-    *CALL.get_or_init(|| {
-        // SAFETY: ntdll is always loaded; the symbol has this signature.
+    static METHOD: std::sync::OnceLock<Option<CopyBack>> = std::sync::OnceLock::new();
+    *METHOD.get_or_init(|| {
+        // SAFETY: ntdll is always loaded. Wine identifies itself by this export;
+        // on native Windows the write routine has the NtWrite signature.
         unsafe {
             let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            if GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some() {
+                return Some(CopyBack::WineRead);
+            }
             let f = GetProcAddress(ntdll, c"NtWriteVirtualMemory".as_ptr().cast())?;
-            Some(std::mem::transmute::<
+            Some(CopyBack::NativeWrite(std::mem::transmute::<
                 unsafe extern "system" fn() -> isize,
                 NtWrite,
-            >(f))
+            >(f)))
         }
     })
 }
@@ -2560,21 +2620,19 @@ type NtWrite = unsafe extern "system" fn(
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
-/// Through `NtWriteVirtualMemory`: the kernel refuses an unmapped
-/// destination page as it does a source page, without asking first for the
-/// destination's region, which `WriteProcessMemory` does at
-/// `VirtualQuery`'s cost (see [`copy_mapped`]). `WriteProcessMemory` is not
-/// a substitute here: it would make read-only pages writable for the copy,
-/// writing around the watch in [`crate::watch`] without the fault it needs.
-/// ntdll exports the symbol on every Windows, so a missing one leaves the
-/// copy back undone rather than patched up.
+/// Wine uses the checked read into the destination. Native Windows uses
+/// the NT write directly, avoiding the region query and temporary changes
+/// to read-only page protections that WriteProcessMemory can perform.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let Some(call) = nt_write_virtual_memory() else {
+    let Some(method) = copy_back_method() else {
         return;
     };
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        let CopyBack::NativeWrite(call) = method else {
+            return read(from, at as *mut u8, n);
+        };
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
@@ -2720,6 +2778,33 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    // Run on both revisions with --ignored --nocapture to measure the active path.
+    #[test]
+    #[ignore = "local copy-back timing"]
+    fn time_small_copy_backs() {
+        const ROW: usize = 4096;
+        let source = vec![0xf3; ROW * 1024];
+        let mut dest = vec![0; source.len()];
+        let mut samples = Vec::new();
+        for round in 0..10 {
+            dest.fill(0);
+            let start = std::time::Instant::now();
+            for offset in (0..source.len()).step_by(ROW) {
+                write_mapped(dest[offset..].as_mut_ptr(), source[offset..].as_ptr(), ROW);
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(dest, source);
+            if round >= 2 {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "1024 x 4 KiB copy-backs, median {:?}",
+            (samples[3] + samples[4]) / 2
+        );
     }
 
     #[test]
@@ -3113,14 +3198,44 @@ impl Host {
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retry = self.present_retry.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        // After a failure, wait for the backoff: one attempt per state, not
+        // one per frame.
+        if !retry.due(now) {
+            return None;
+        }
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+            match self.presenter(width, height, format) {
+                Ok(p) => {
+                    let attempts = retry.reset();
+                    if attempts > 0 {
+                        tracing::info!(attempts, "swap chain created after the failed attempts");
+                    }
+                    *presenter = Some(p);
+                }
+                Err((step, e)) => {
+                    retry.failed(now);
+                    if retry.attempts == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            step = step.name(),
+                            width,
+                            height,
+                            format = format.0,
+                            "no swap chain; the next attempt waits for the backoff"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            step = step.name(),
+                            attempts = retry.attempts,
+                            "no swap chain"
+                        );
+                    }
                     return None;
                 }
-            };
+            }
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
@@ -3130,9 +3245,26 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    retry.reset();
+                    (p.width, p.height, p.format) = (width, height, format);
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    retry.failed(now);
+                    if retry.attempts == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            width,
+                            height,
+                            "swap chain not resized; the next attempt waits for the backoff"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            attempts = retry.attempts,
+                            "swap chain not resized"
+                        );
+                    }
                     return None;
                 }
             }
@@ -3232,14 +3364,15 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> windows::core::Result<Presenter> {
+    ) -> Result<Presenter, (PresentStep, windows::core::Error)> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            None => window(width, height).map_err(|e| (PresentStep::Window, e))?,
         };
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+                .map_err(|e| (PresentStep::Factory, e))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -3254,9 +3387,11 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
-            let copy = self.new_list()?;
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                .map_err(|e| (PresentStep::SwapChain, e))?
+                .cast::<IDXGISwapChain3>()
+                .map_err(|e| (PresentStep::SwapChain, e))?;
+            let copy = self.new_list().map_err(|e| (PresentStep::List, e))?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             let mut p = Presenter {
@@ -3817,22 +3952,6 @@ mod tests {
         assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
     }
 
-    /// A slot's upload fill is asked for by every draw that binds it: the
-    /// list takes it once, and again only after a title copy (which forgets
-    /// what was refreshed, as `defer_copy` and `defer` do).
-    #[test]
-    fn an_upload_fill_is_taken_once_until_a_title_copy() {
-        let mut d = Deferred::default();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
-        assert!(!d.first_fill(0x1000, 0x2000, 24));
-        // Another source, length or upload is a fill of its own.
-        assert!(d.first_fill(0x1000, 0x2018, 24));
-        assert!(d.first_fill(0x1000, 0x2000, 48));
-        assert!(d.first_fill(0x3000, 0x2000, 24));
-        d.refreshed.clear();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
-    }
-
     #[test]
     fn adapter_filter_matches_case_insensitively() {
         assert!(adapter_matches("NVIDIA GeForce RTX 3070 Ti", "rtx 3070"));
@@ -3972,6 +4091,18 @@ mod tests {
         assert_eq!(d3.load(Ordering::SeqCst), 0);
         submitted.end_submit();
         assert_eq!(d3.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_execute_does_not_submit() {
+        // D3D12 forbids ExecuteCommandLists with NumCommandLists == 0.
+        let Some(host) = host() else {
+            return;
+        };
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[]);
+        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(before, after, "empty execute must not bump the fence");
     }
 
     #[test]
@@ -4320,5 +4451,85 @@ mod title_memory_io {
         let now = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
         assert!(now.iter().all(|&b| b == 0x5a));
         release(base);
+    }
+}
+
+#[cfg(test)]
+mod present_retry {
+    use super::{PresentStep, Retry, retry_delay};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_backoff_starts_short_and_stops_at_a_second() {
+        let schedule: Vec<u64> = (1..=7).map(|n| retry_delay(n).as_millis() as u64).collect();
+        assert_eq!(schedule, [100, 200, 400, 800, 1_000, 1_000, 1_000]);
+    }
+
+    #[test]
+    fn a_failed_attempt_waits_before_the_next_one() {
+        let start = Instant::now();
+        let mut retry = Retry::new();
+        // Nothing has failed, so an attempt is due.
+        assert!(retry.due(start));
+        retry.failed(start);
+        assert_eq!(retry.attempts, 1);
+        assert!(!retry.due(start));
+        assert!(!retry.due(start + Duration::from_millis(99)));
+        assert!(retry.due(start + Duration::from_millis(100)));
+        // A second failure doubles the wait and counts.
+        let second = start + Duration::from_millis(100);
+        retry.failed(second);
+        assert_eq!(retry.attempts, 2);
+        assert!(!retry.due(second + Duration::from_millis(199)));
+        assert!(retry.due(second + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn a_working_attempt_clears_the_state_and_reports_the_failures() {
+        let start = Instant::now();
+        let mut retry = Retry::new();
+        for _ in 0..3 {
+            retry.failed(start);
+        }
+        assert_eq!(retry.attempts, 3);
+        assert_eq!(retry.reset(), 3);
+        assert_eq!(retry.attempts, 0);
+        assert!(retry.due(start));
+        // A later failure starts the schedule over.
+        retry.failed(start);
+        assert!(!retry.due(start + Duration::from_millis(99)));
+    }
+
+    /// A minute behind a desktop that never appears: one attempt per backoff
+    /// instead of one per presented frame.
+    #[test]
+    fn a_minute_without_a_desktop_asks_a_bounded_number_of_times() {
+        let mut retry = Retry::new();
+        let mut now = Instant::now();
+        let mut attempts = 0u32;
+        for _ in 0..1_200 {
+            // 60 s at 20 fps.
+            if retry.due(now) {
+                attempts += 1;
+                retry.failed(now);
+            }
+            now += Duration::from_millis(50);
+        }
+        assert!(
+            (59..=64).contains(&attempts),
+            "{attempts} attempts in a minute, one per backoff expected"
+        );
+    }
+
+    #[test]
+    fn every_step_of_a_presenter_has_a_name() {
+        for step in [
+            PresentStep::Window,
+            PresentStep::Factory,
+            PresentStep::SwapChain,
+            PresentStep::List,
+        ] {
+            assert!(!step.name().is_empty());
+        }
     }
 }

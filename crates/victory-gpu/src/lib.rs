@@ -12,8 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! share, [`console`] which console model the title sees. Presentation
+//! (the title's present plane → host swap chain) lives in [`queue`].
 
 // Off Windows there is no host GPU: only the portable parts are built (for
 // their tests), and the paths that feed the host go unused.
@@ -45,6 +45,9 @@ mod hlsl;
 mod host;
 #[cfg(windows)]
 mod indirect;
+// CPU model of the GPU budget: only referenced from unit tests.
+#[cfg(test)]
+mod indirect_budget;
 pub mod list;
 pub mod object;
 pub mod pipeline;

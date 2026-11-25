@@ -16,24 +16,11 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::{Host, HostList, host};
 use crate::shadow::Shadow;
 
-/// An aligned upload copy backing a buffer SRV whose offset inside its shadow
-/// buffer is not a multiple of its element stride. Kept persistently mapped so
-/// each draw or dispatch using the slot can schedule a submission-time refresh
-/// (safe to overwrite in place because the host queue waits for each submission
-/// to finish before the next one runs).
-#[derive(Clone)]
-struct UnalignedCopy {
-    resource: ID3D12Resource,
-    dst: usize,
-    src: usize,
-    len: usize,
-}
-
-/// Submission-time refresh state for a slot: either an aligned copy upload or
-/// an aliased view whose exact backing shadow may differ from `buffer_range`.
+/// Submission-time refresh state for a slot whose exact backing shadow may
+/// differ from `buffer_range` (a structured alias, or a view off an element of
+/// its host copy that reads its own aligned copy).
 #[derive(Clone)]
 enum SlotRefresh {
-    Unaligned(UnalignedCopy),
     Shadow {
         shadow: Arc<Shadow>,
         address: u64,
@@ -172,8 +159,8 @@ pub(crate) struct HostHeap {
     /// memory). Retaining `Arc<Shadow>` also keeps loose shadow windows pinned
     /// in the shadow cache while any descriptor slot references their buffer.
     kept: Mutex<Vec<Option<KeptBacking>>>,
-    /// Slots requiring submission-time title-memory refresh (`UnalignedCopy`
-    /// uploads or aliased structured SRV shadows).
+    /// Slots requiring submission-time title-memory refresh (aliased structured
+    /// SRV shadows, or a view's own copy when off an element of its host copy).
     refreshes: Mutex<HashMap<u32, SlotRefresh>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
@@ -606,12 +593,6 @@ impl HostHeap {
                 }),
                 None,
             ),
-            Kept::Unaligned(copy) => (
-                Some(KeptBacking::Resource {
-                    _resource: copy.resource.clone(),
-                }),
-                Some(SlotRefresh::Unaligned(copy)),
-            ),
             Kept::AliasedShadow {
                 shadow,
                 address,
@@ -650,9 +631,9 @@ impl HostHeap {
         }
     }
 
-    /// If slot `index` has a registered refresh entry (`UnalignedCopy` upload
-    /// or aliased shadow range), schedules a submission-time refresh on `list`
-    /// and returns `true`.
+    /// If slot `index` has a registered refresh entry (aliased shadow or a
+    /// view's own copy), schedules a submission-time refresh on `list` and
+    /// returns `true`.
     pub(crate) fn refresh_slot(&self, index: u32, list: &HostList) -> bool {
         let refresh = {
             let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
@@ -662,15 +643,6 @@ impl HostHeap {
             map.get(&index).cloned()
         };
         match refresh {
-            Some(SlotRefresh::Unaligned(copy)) => {
-                list.defer_fill_upload(
-                    copy.resource,
-                    copy.dst as *mut u8,
-                    copy.src as *const u8,
-                    copy.len,
-                );
-                true
-            }
             Some(SlotRefresh::Shadow {
                 shadow,
                 address,
@@ -680,6 +652,19 @@ impl HostHeap {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Refreshes every off-element / aliased buffer view this heap holds.
+    /// Table paths call [`Self::refresh_slot`] per entry; ResourceHeap draws
+    /// never walk those tables, so bindless must refresh them here (#553).
+    pub(crate) fn refresh_special_buffers(&self, list: &HostList) {
+        let special: Vec<u32> = {
+            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+            map.keys().copied().filter(|&i| i < self.count).collect()
+        };
+        for index in special {
+            let _ = self.refresh_slot(index, list);
         }
     }
 
@@ -1291,7 +1276,6 @@ enum Kept {
         title: usize,
         is_uav: bool,
     },
-    Unaligned(UnalignedCopy),
     AliasedShadow {
         shadow: Arc<Shadow>,
         address: u64,
@@ -1443,11 +1427,15 @@ fn buffer_srv_inner(
         // The title's placed buffer starts at an address that is not a
         // multiple of `element` inside our larger host shadow buffer (e.g. a
         // non-power-of-two structured element stride inside a ring buffer).
-        // Copy the viewed bytes into a persistently mapped aligned upload
-        // buffer starting at element 0, and track it so draws refresh it from
-        // title memory at submission time.
-        const MAX_UNALIGNED_COPY: u64 = 1 << 20;
-        if bytes == 0 || bytes > MAX_UNALIGNED_COPY {
+        // Give the view its own host copy that starts at the view so elements
+        // land where the title put them. The slot holds it; refresh copies
+        // only the pages the title wrote.
+        //
+        // shortcut: prepared from title memory, so it does not see what a
+        // shader of the same submission wrote in that range before the read.
+        // Getting that right needs host buffer states across the submission.
+        let start = address.checked_add(view_offset)?;
+        if bytes == 0 {
             once!(
                 offset,
                 element,
@@ -1455,21 +1443,18 @@ fn buffer_srv_inner(
             );
             return None;
         }
-        let start = address.checked_add(view_offset)?;
-        let (upload, dst) = host.upload_buffer(bytes)?;
-        crate::host::copy_mapped(dst, start as *const u8, bytes as usize, false);
+        let copy = crate::shadow::aligned(start, bytes)?;
         buffer.FirstElement = 0;
-        // SAFETY: a live upload buffer and a slot of our heap.
+        // SAFETY: a live buffer and a slot of our heap.
         unsafe {
             host.device
-                .CreateShaderResourceView(&upload, Some(&desc), at)
+                .CreateShaderResourceView(&copy.buffer, Some(&desc), at)
         };
-        return Some(Kept::Unaligned(UnalignedCopy {
-            resource: upload,
-            dst: dst as usize,
-            src: start as usize,
-            len: bytes as usize,
-        }));
+        return Some(Kept::AliasedShadow {
+            shadow: copy,
+            address: start,
+            len: bytes,
+        });
     }
     buffer.FirstElement += offset / element;
     if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
@@ -2396,9 +2381,8 @@ mod tests {
     }
 
     /// A structured buffer SRV whose offset inside its shadow buffer is not a
-    /// multiple of its element stride is copied into an aligned upload buffer
-    /// and refreshed from title memory when a command list referencing the slot
-    /// is submitted.
+    /// multiple of its element stride reads its own aligned host copy, refreshed
+    /// from title memory when a command list referencing the slot is submitted.
     #[test]
     fn unaligned_structured_buffer_srv_refreshes_on_submission() {
         let Some(host) = host() else {
@@ -2426,9 +2410,13 @@ mod tests {
         };
         let kept = buffer_srv(base + 32, 24, desc, heap.cpu(0))
             .expect("unaligned structured SRV should succeed");
-        let (upload, dst) = match &kept {
-            Kept::Unaligned(copy) => (copy.resource.clone(), copy.dst as *const u8),
-            _ => panic!("expected an unaligned upload copy"),
+        let (copy, start, len) = match &kept {
+            Kept::AliasedShadow {
+                shadow,
+                address,
+                len,
+            } => (shadow.clone(), *address, *len),
+            _ => panic!("expected an aligned view copy"),
         };
         heap.keep(0, kept);
 
@@ -2442,14 +2430,10 @@ mod tests {
         host.execute(&[&list]);
         crate::shadow::unregister(base as usize, base);
 
-        // SAFETY: `upload` is persistently mapped for its lifetime (`24` bytes)
-        // and `host.execute` has completed.
-        unsafe {
-            assert_eq!(upload.GetDesc().Width, 24);
-            let got = std::slice::from_raw_parts(dst, 24);
-            assert_eq!(got, &updated);
-            assert!(host.device.GetDeviceRemovedReason().is_ok());
-        }
+        let got = copy.bytes(start, len).expect("view bytes inside its copy");
+        assert_eq!(got, &updated);
+        // SAFETY: queries the live host device's removal status only.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     struct OwnedObject(crate::object::This);
@@ -3649,16 +3633,17 @@ void main() {
             );
 
             // Mutate dword 17 after creating the alias to prove submission-time
-            // refresh updates the backing resource (shadow or UnalignedCopy).
+            // refresh updates the backing resource (buffer shadow or the view's
+            // own aligned copy).
             let mutated_word = tag | 0x00FF_0011;
             write_word(&mut backing, rec_off + 17 * 4, mutated_word);
 
             let list = host.new_list().expect("host list");
             assert!(heap.refresh_slot(dyn_idx, &list));
             if placed_off % 64 != 0 {
-                // `dyn_idx` reads an `UnalignedCopy` upload buffer rather than `shadow`,
-                // so refresh `canonical_raw`'s first record word independently to check
-                // canonical slot 0's raw readback too.
+                // `dyn_idx` reads the view's own aligned copy rather than the
+                // buffer shadow, so refresh the canonical raw slot's first
+                // record word independently for its readback check.
                 crate::shadow::find(base + rec_off as u64, 4)
                     .expect("registered shadow")
                     .refresh(&list, base + rec_off as u64, 4);
