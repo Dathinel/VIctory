@@ -1043,10 +1043,10 @@ impl State {
         host: &crate::descriptor::host::HostHeap,
         heap_id: usize,
         access: RawAccess,
-        view: Option<(&ID3D12Resource, u64, u64)>,
+        view: Option<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
     ) -> Option<u32> {
-        let range = view.map(|(buffer, offset, len)| RawBufferRange {
-            resource: buffer.as_raw() as usize,
+        let range = view.map(|(shadow, offset, len)| RawBufferRange {
+            resource: shadow.buffer.as_raw() as usize,
             offset,
             len,
         });
@@ -1057,11 +1057,11 @@ impl State {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 let index = host.dynamic(1)?;
                 match (access, view) {
-                    (RawAccess::Read, Some((buffer, offset, len))) => {
-                        host.raw_at(index, buffer, offset, len)
+                    (RawAccess::Read, Some((shadow, offset, len))) => {
+                        host.raw_at(index, shadow, offset, len)
                     }
-                    (RawAccess::ReadWrite, Some((buffer, offset, len))) => {
-                        host.raw_uav_at(index, buffer, offset, len)
+                    (RawAccess::ReadWrite, Some((shadow, offset, len))) => {
+                        host.raw_shadow_uav_at(index, shadow, offset, len)
                     }
                     (RawAccess::Read, None) => host.null_raw_at(index),
                     (RawAccess::ReadWrite, None) => host.null_raw_uav_at(index),
@@ -1095,7 +1095,7 @@ impl State {
             host,
             key,
             RawAccess::Read,
-            Some((&read.shadow.buffer, offset - bias, read.bytes + bias)),
+            Some((&read.shadow, offset - bias, read.bytes + bias)),
         )?;
         let state = if compute {
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
@@ -1143,7 +1143,7 @@ impl State {
                         len
                     }
                 };
-                (len >= 4).then_some((&s.buffer, offset, len))
+                (len >= 4).then_some((s, offset, len))
             } else {
                 once!(
                     address = format_args!("{a:#x}"),

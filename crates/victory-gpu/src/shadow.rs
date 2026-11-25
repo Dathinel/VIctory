@@ -21,11 +21,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATES, ID3D12Resource,
 };
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
@@ -225,6 +226,8 @@ pub(crate) struct Shadow {
     before: Mutex<Before>,
     /// Present when `buffer` lives in ReBAR `D3D12_HEAP_TYPE_GPU_UPLOAD` VRAM.
     rebar: Option<RebarShadow>,
+    /// Monotonic tick of the last loose-cache access (0 for registered buffers).
+    last_used: AtomicU64,
 }
 
 impl Drop for Shadow {
@@ -409,6 +412,7 @@ impl Shadow {
                 mirror: Mutex::new(None),
                 hashes: Mutex::new(None),
             }),
+            last_used: AtomicU64::new(0),
         }
     }
 
@@ -521,6 +525,21 @@ impl Shadow {
                 }
             }
         }
+    }
+
+    fn touch(&self) {
+        self.last_used.store(
+            LOOSE_TICK.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn read_test_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        let (start, end) = self.inside(address as usize, len);
+        // SAFETY: `self.data` is persistently mapped for `self.len` bytes and
+        // `inside` clamps `start..end` to `0..self.len`.
+        unsafe { std::slice::from_raw_parts(self.data.add(start), end - start) }.to_vec()
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1130,19 +1149,170 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     LOOSE
         .read()
         .unwrap_or_else(|e| e.into_inner())
+        .entries
         .get(&(start, len))
         .cloned()
 }
 
-/// Titles also use memory outside any buffer object as GPU memory (Grand
-/// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// Titles also use memory outside any buffer object as GPU memory (from their
+/// own allocators). Such memory gets copies of the aligned windows it touches,
+/// bounded by a RAM-scaled LRU cache.
 const WINDOW: u64 = 4 << 20;
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+
+/// Monotonic access clock for LRU eviction of loose shadow windows.
+static LOOSE_TICK: AtomicU64 = AtomicU64::new(1);
+
+fn total_physical_ram_bytes() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: `status` is initialized with `dwLength` set to its byte size as
+    // required by `GlobalMemoryStatusEx`.
+    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
+    (ok != 0 && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+fn loose_budget_for_ram(total_ram_bytes: Option<u64>) -> u64 {
+    match total_ram_bytes {
+        None => 256 * MIB,
+        Some(ram) if ram <= 16 * GIB => 128 * MIB,
+        Some(ram) if ram <= 32 * GIB => 256 * MIB,
+        Some(_) => 512 * MIB,
+    }
+}
+
+#[cfg(all(test, windows))]
+static TEST_LOOSE_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(test, windows))]
+static TEST_LOOSE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(all(test, windows))]
+pub(crate) struct LooseBudgetGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, windows))]
+impl Drop for LooseBudgetGuard {
+    fn drop(&mut self) {
+        TEST_LOOSE_BUDGET.store(0, Ordering::SeqCst);
+        let drained: Vec<Arc<Shadow>> = {
+            let mut guard = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+            guard.total_bytes = 0;
+            std::mem::take(&mut guard.entries).into_values().collect()
+        };
+        drop(drained);
+    }
+}
+
+/// Test-only helper that clears the global loose shadow cache and forces an
+/// explicit byte budget until the returned guard drops.
+#[cfg(all(test, windows))]
+pub(crate) fn isolated_loose_budget(budget: u64) -> LooseBudgetGuard {
+    let lock = TEST_LOOSE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut guard = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        guard.total_bytes = 0;
+        guard.entries.clear();
+    }
+    TEST_LOOSE_BUDGET.store(budget, Ordering::SeqCst);
+    LooseBudgetGuard { _lock: lock }
+}
+
+fn loose_budget() -> u64 {
+    #[cfg(all(test, windows))]
+    {
+        let override_budget = TEST_LOOSE_BUDGET.load(Ordering::SeqCst);
+        if override_budget != 0 {
+            return override_budget;
+        }
+    }
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let ram = total_physical_ram_bytes();
+        let budget = loose_budget_for_ram(ram);
+        tracing::info!(
+            total_ram_mib = ram.map(|b| b / MIB),
+            budget_mib = budget / MIB,
+            "loose shadow cache budget"
+        );
+        budget
+    })
+}
+
+struct LooseCache {
+    entries: BTreeMap<(u64, u64), Arc<Shadow>>,
+    total_bytes: u64,
+}
+
+impl LooseCache {
+    const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Evicts least-recently-used idle windows while `total_bytes > budget`,
+    /// never evicting `keep`, entries still held outside the cache
+    /// (`Arc::strong_count > 1`), or entries with pending GPU copy-back ranges.
+    fn evict_over_budget(&mut self, keep: (u64, u64), budget: u64) -> Vec<Arc<Shadow>> {
+        if self.total_bytes <= budget {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(u64, (u64, u64))> = self
+            .entries
+            .iter()
+            .filter_map(|(&key, shadow)| {
+                if key == keep || Arc::strong_count(shadow) != 1 {
+                    return None;
+                }
+                if !shadow
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+                {
+                    return None;
+                }
+                Some((shadow.last_used.load(Ordering::Relaxed), key))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(tick, _)| tick);
+        let mut evicted = Vec::new();
+        for (_, key) in candidates {
+            if self.total_bytes <= budget {
+                break;
+            }
+            if let Some(shadow) = self.entries.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(shadow.len);
+                evicted.push(shadow);
+            }
+        }
+        if !evicted.is_empty() {
+            tracing::debug!(
+                evicted = evicted.len(),
+                total_bytes = self.total_bytes,
+                budget,
+                "evicted idle loose shadow windows"
+            );
+        }
+        evicted
+    }
+}
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static LOOSE: RwLock<LooseCache> = RwLock::new(LooseCache::new());
 
 /// Copies of just one view's bytes, by (start, length): for a view whose
 /// start is not on an element of its host copy (`aligned`). The heap slot
@@ -1225,32 +1395,54 @@ fn range_inside(address: u64, len: u64, start: u64, size: u64) -> u64 {
 }
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    loose_in(&LOOSE, address, end, loose_budget())
+}
+
+fn loose_in(
+    cache: &RwLock<LooseCache>,
+    address: u64,
+    end: u64,
+    budget: u64,
+) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    if let Some(shadow) = LOOSE
+    let key = (start, len);
+    if let Some(shadow) = cache
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&(start, len))
+        .entries
+        .get(&key)
     {
+        shadow.touch();
         return Some(shadow.clone());
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    let (shadow, evicted) = {
+        let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = guard.entries.get(&key) {
+            shadow.touch();
+            return Some(shadow.clone());
+        }
+        // Keep unbounded loose 4 MiB windows in system memory so they cannot
+        // starve registered title buffers out of the bounded ReBAR budget.
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
+        let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, None));
+        shadow.touch();
+        guard.entries.insert(key, shadow.clone());
+        guard.total_bytes = guard.total_bytes.saturating_add(len);
+        let evicted = guard.evict_over_budget(key, budget);
+        (shadow, evicted)
+    };
+    for old in evicted {
+        crate::host::retire(old);
     }
-    // Keep unbounded loose 4 MiB windows in system memory so they cannot
-    // starve registered title buffers out of the bounded ReBAR budget.
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, None));
-    map.insert((start, len), shadow.clone());
     Some(shadow)
 }
 
@@ -1267,6 +1459,7 @@ pub(crate) fn near(va: u64) -> String {
         LOOSE
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
@@ -1962,5 +2155,137 @@ mod tests {
         assert_eq!(stale_pages_in(base, &copied, a, e, &[]), vec![base + 1]);
         // Once all pages are copied and clean, nothing is stale.
         assert!(stale_pages_in(base, &[10, 10, 10, 10], a, e, &written).is_empty());
+    }
+
+    #[test]
+    fn loose_budget_scales_across_ram_tiers() {
+        assert_eq!(loose_budget_for_ram(None), 256 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(8 * GIB)), 128 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(16 * GIB)), 128 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(16 * GIB + 1)), 256 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(32 * GIB)), 256 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(32 * GIB + 1)), 512 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(64 * GIB)), 512 * MIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loose_evicts_lru_idle_windows_over_budget_and_skips_in_use_or_pending() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let cache = RwLock::new(LooseCache::new());
+        let budget = 2 * WINDOW;
+        let base = 0x1000_0000_0000_u64;
+        let win = |i: u64| base + i * WINDOW;
+
+        let weak0 = Arc::downgrade(&loose_in(&cache, win(0), win(0) + 64, budget).expect("win 0"));
+        let weak1 = Arc::downgrade(&loose_in(&cache, win(1), win(1) + 64, budget).expect("win 1"));
+        assert_eq!(weak0.strong_count(), 1);
+        assert_eq!(weak1.strong_count(), 1);
+
+        // Touch window 0 so window 1 becomes the least-recently-used entry.
+        drop(loose_in(&cache, win(0), win(0) + 64, budget).expect("touch win 0"));
+
+        // Inserting window 2 exceeds the 2-window budget and immediately drops
+        // idle LRU window 1 through `retire`.
+        let weak2 = Arc::downgrade(&loose_in(&cache, win(2), win(2) + 64, budget).expect("win 2"));
+        assert_eq!(weak1.strong_count(), 0, "idle LRU window 1 must be evicted");
+        assert_eq!(weak0.strong_count(), 1, "MRU window 0 must stay cached");
+        assert_eq!(weak2.strong_count(), 1, "new window 2 must stay cached");
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.total_bytes, budget);
+            assert_eq!(guard.entries.len(), 2);
+        }
+
+        // With an active epoch, evicted window 0 leaves the cache immediately
+        // but stays alive in the retirement queue until the epoch completes.
+        let list = host.new_list().expect("host list");
+        list.mark_work();
+        let weak3 = Arc::downgrade(&loose_in(&cache, win(3), win(3) + 64, budget).expect("win 3"));
+        {
+            let guard = cache.read().unwrap();
+            assert!(!guard.entries.contains_key(&(win(0), WINDOW)));
+            assert_eq!(guard.total_bytes, budget);
+        }
+        assert_eq!(
+            weak0.strong_count(),
+            1,
+            "evicted loose window must wait for active epochs"
+        );
+        list.close();
+        list.reset();
+        assert_eq!(
+            weak0.strong_count(),
+            0,
+            "evicted loose window must drop once active epochs finish"
+        );
+
+        // Pin window 2 via an external Arc (strong_count > 1) and window 3 via
+        // a pending GPU UAV copy-back range; neither may be evicted.
+        let held2 = loose_in(&cache, win(2), win(2) + 64, budget).expect("hold win 2");
+        {
+            let s3 = loose_in(&cache, win(3), win(3) + 64, budget).expect("mark win 3 pending");
+            s3.pending
+                .lock()
+                .unwrap()
+                .push((win(3) as usize, win(3) as usize + 64));
+        }
+        let weak4 = Arc::downgrade(&loose_in(&cache, win(4), win(4) + 64, budget).expect("win 4"));
+        assert_eq!(
+            weak2.strong_count(),
+            2,
+            "in-use window 2 must not be evicted"
+        );
+        assert_eq!(
+            weak3.strong_count(),
+            1,
+            "window 3 with pending copy-back must not be evicted"
+        );
+        assert_eq!(weak4.strong_count(), 1);
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.entries.len(), 3);
+            assert_eq!(guard.total_bytes, 3 * WINDOW);
+        }
+
+        // Once window 2 is released and window 3's pending copy-back clears,
+        // the next insert drains both stale windows back down to budget.
+        drop(held2);
+        weak3
+            .upgrade()
+            .expect("win 3 still live")
+            .pending
+            .lock()
+            .unwrap()
+            .clear();
+        let weak5 = Arc::downgrade(&loose_in(&cache, win(5), win(5) + 64, budget).expect("win 5"));
+        assert_eq!(weak2.strong_count(), 0);
+        assert_eq!(weak3.strong_count(), 0);
+        assert_eq!(weak4.strong_count(), 1);
+        assert_eq!(weak5.strong_count(), 1);
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.entries.len(), 2);
+            assert_eq!(guard.total_bytes, budget);
+        }
+
+        // Re-accessing previously evicted window 1 cleanly recreates its shadow.
+        let recreated =
+            loose_in(&cache, win(1) + 128, win(1) + 256, budget).expect("recreate win 1");
+        assert_eq!(recreated.start, win(1));
+        assert_eq!(recreated.len, WINDOW);
+        assert_ne!(recreated.gpu(win(1) + 128), 0);
+        assert_eq!(weak4.strong_count(), 0);
+        assert_eq!(weak5.strong_count(), 1);
+        drop(recreated);
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.entries.len(), 2);
+            assert_eq!(guard.total_bytes, budget);
+            assert!(guard.entries.contains_key(&(win(1), WINDOW)));
+        }
     }
 }
