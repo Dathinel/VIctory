@@ -1,0 +1,83 @@
+diff --git a/crates/victory-formats/src/bcpack.rs b/crates/victory-formats/src/bcpack.rs
+index 360dce1..049a881 100644
+--- a/crates/victory-formats/src/bcpack.rs
++++ b/crates/victory-formats/src/bcpack.rs
+@@ -1590,4 +1590,43 @@ mod tests {
+         }
+         assert!(n > 0);
+     }
++
++    #[test]
++    fn vic117_bc1_cpu() {
++        let dir=std::path::PathBuf::from(std::env::var_os("BC1_TEST_DIR").unwrap());
++        for blocks in [2u32,260] {
++            let mut t=Tables::parse(&tables()).unwrap();
++            let mut dict=vec![Plain::default();255];
++            for (j,v) in dict.iter_mut().enumerate() {
++                for (k,e) in v.ep[..6].iter_mut().enumerate() { *e=((j*17+k*11)&((1<<BC1.ep[k])-1)) as u8; }
++                for (k,x) in v.ix[..16].iter_mut().enumerate() { *x=((j+k*3)&3) as u8; }
++            }
++            let mut records=vec![[0u8;12];blocks as usize];
++            if blocks==2 {
++                records[0]=[0,0,2,1,4,3,6,2,0x13,0x27,0x54,0x71];
++                records[1]=[2,0,3,2,1,4,1,3,0x71,0x54,0x27,0x13];
++            } else {
++                for (i,n) in t.rank1.iter_mut().enumerate() { *n=(i as u8).wrapping_mul(73).rotate_left(3); }
++                let mut seed=0x12345678u32;
++                for rec in &mut records {
++                    for v in rec {seed=seed.wrapping_mul(1664525).wrapping_add(1013904223);*v=(seed>>24) as u8;}
++                }
++                records[259][0]=0; records[259][1]=255;
++            }
++            let mut want=vec![0u8;blocks as usize*8];
++            plain(records.iter().map(|v|v.as_slice()),want.chunks_exact_mut(8),&dict,&BC1,
++                  |s|bc1_residual(&t,s),|v,b|bc1_color(&v.ep,&v.ix,b)).unwrap();
++            if blocks==2 {
++                assert_eq!(want[..8],0x9a28_3291_f061_0fe2u64.to_le_bytes());
++                assert_eq!(want[8..],0x2319_a982_005f_f801u64.to_le_bytes());
++            }
++            let mut input=Vec::new();
++            for n in [blocks,268,268+8*255] {input.extend(n.to_le_bytes());}
++            input.extend(t.rank1);
++            for v in &dict {let mut block=[0;8];bc1_color(&v.ep,&v.ix,&mut block);input.extend(block);}
++            for rec in records {input.extend(rec);}
++            std::fs::write(dir.join(format!("input-{blocks}.bin")),input).unwrap();
++            std::fs::write(dir.join(format!("expected-{blocks}.bin")),want).unwrap();
++        }
++    }
+ }
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 201acdb..aa64eaa 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -1807,3 +1807,30 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
+         refused.err()
+     );
+ }
++
++#[test]
++fn vic117_bc1_gpu() {
++    use super::host::Stride;
++    let dir=std::path::PathBuf::from(std::env::var_os("BC1_TEST_DIR").unwrap());
++    let mut template=build_valu_cs(&[vop1(1,0,128)]);
++    template.dxil=std::fs::read(dir.join("bc1-records.dxil")).unwrap();
++    for (label,warp) in [("hardware",false),("warp",true)] {
++        let host=Host::new(warp).unwrap();
++        let (root,pso)=host.compute_pipeline(&template).unwrap();
++        for blocks in [2u32,260] {
++            let bytes=std::fs::read(dir.join(format!("input-{blocks}.bin"))).unwrap();
++            let data:Vec<u32>=bytes.chunks_exact(4).map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect();
++            let expected=std::fs::read(dir.join(format!("expected-{blocks}.bin"))).unwrap();
++            let out=host.dispatch(&root,&pso,&Dispatch {
++                roots:vec![(0,Root::Constants(vec![0;template.user_data_dwords().max(1) as usize]))],
++                views:&[View::Buffer{data:&data,stride:Stride::Raw},View::RawUav(blocks*2+2)],
++                samplers:&[],groups:[1,1,1],
++            }).unwrap();
++            let words=out.last().unwrap();
++            let got:Vec<u8>=words.iter().flat_map(|v|v.to_le_bytes()).collect();
++            assert_eq!(&got[..expected.len()],expected,"{label}: {blocks}");
++            assert_eq!(&got[expected.len()..],&[0;8]);
++            eprintln!("{label}: {blocks} blocks matched; tail unchanged");
++        }
++    }
++}

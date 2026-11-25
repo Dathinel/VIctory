@@ -1,0 +1,129 @@
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 3bf9d61..88660fa 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -1747,3 +1747,124 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
+         refused.err()
+     );
+ }
++
++fn run_bc1_cases(
++    shader: &HostShader,
++    cases: &[[u32; 4]],
++    mut check: impl FnMut(&str, usize, [u32; 4], [u32; 2]),
++) {
++    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++    let mut ran = 0;
++    for (label, warp) in [("hardware", false), ("warp", true)] {
++        let host = match Host::new(warp) {
++            Ok(host) => host,
++            Err(e) => {
++                eprintln!("no SM 6.6 {label} device ({e}); skipped");
++                continue;
++            }
++        };
++        let (root, pso) = host
++            .compute_pipeline(shader)
++            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
++        for (i, &inputs) in cases.iter().enumerate() {
++            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
++            for u in &shader.user_data {
++                ud[u.index as usize] = match (u.root, u.slot) {
++                    (RootType::Constants, 0) => inputs[u.dword as usize],
++                    (RootType::Table, 1) => 0,
++                    other => panic!("unexpected user data {other:?}"),
++                };
++            }
++            let out = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: vec![(0, Root::Constants(ud))],
++                        views: &[View::RawUav(2)],
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
++            check(label, i, inputs, [out[0][0], out[0][1]]);
++        }
++        ran += 1;
++    }
++    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
++}
++
++#[test]
++fn vic116_bc1_color() {
++    const BC1_CODE: [u32; 4] = [0, 2, 3, 1];
++    fn bc1_color(ep: &[u8], ix: &[u8], out: &mut [u8]) {
++        let c0 = u16::from(ep[0]) << 11 | u16::from(ep[1]) << 5 | u16::from(ep[2]);
++        let c1 = u16::from(ep[3]) << 11 | u16::from(ep[4]) << 5 | u16::from(ep[5]);
++        let bits = (0..16).fold(0, |acc, p| {
++            acc | BC1_CODE[usize::from(ix[p] & 3)] << (2 * p)
++        });
++        out[..2].copy_from_slice(&c0.to_le_bytes());
++        out[2..4].copy_from_slice(&c1.to_le_bytes());
++        out[4..8].copy_from_slice(&bits.to_le_bytes());
++    }
++    // Each endpoint input has R, G, B in successive bytes.
++    // v3 holds the 16 pixel ranks as consecutive 2-bit fields.
++    let mut body = Vec::new();
++    for (src,dst) in [(1u8,5u8),(2,6)] {
++        body.extend(vop3(0x148,dst,vgpr(src),144,133)); // blue, offset 16
++        body.extend(vop3(0x148,7,vgpr(src),136,134)); // green
++        body.extend(vop3(0x36f,dst,vgpr(7),133,vgpr(dst)));
++        body.extend(vop3(0x148,7,vgpr(src),128,133)); // red
++        body.extend(vop3(0x36f,dst,vgpr(7),139,vgpr(dst)));
++    }
++    body.extend(vop3(0x36f,0,vgpr(6),144,vgpr(5)));
++    // For a rank (hi,lo), the BC1 code is (hi XOR lo, hi).
++    let vop2=|op:u32,d:u8,a:u16,b:u8| op<<25 | u32::from(d)<<17 | u32::from(b)<<9 | u32::from(a);
++    body.push(vop2(0x16,5,129,3));
++    body.extend([vop1(1,6,255),0x55555555]);
++    body.push(vop2(0x1b,7,vgpr(6),5));
++    body.push(vop2(0x1d,8,vgpr(3),5));
++    body.push(vop2(0x1b,8,vgpr(6),8));
++    body.extend(vop3(0x36f,8,vgpr(8),129,vgpr(7)));
++    body.extend(buffer_store_dword(8,8,4));
++    let shader=build_valu_cs(&body); // harness stores v0 at offset zero
++    if let Some(dir)=std::env::var_os("BCPACK_SHADER_OUTPUT") {
++        let dir=std::path::Path::new(&dir);
++        std::fs::write(dir.join("bc1-color.dxil"),&shader.dxil).unwrap();
++        let words:Vec<u8>=body.iter().flat_map(|w|w.to_le_bytes()).collect();
++        std::fs::write(dir.join("bc1-color.rdna2"),words).unwrap();
++    }
++    let mut cases=Vec::new();
++    for x in 0u32..256 {
++        let rgb=|k:u32| (k&31)|((k*3&63)<<8)|((k*7&31)<<16);
++        let ranks=u32::from_le_bytes([x as u8,(x^0xff) as u8,(x as u8).rotate_left(3),(x as u8).wrapping_mul(73)]);
++        cases.push([rgb(x),rgb(255-x),ranks,0]);
++    }
++    cases.extend([[0,0,0,0],[0x1f3f1f,0x1f3f1f,u32::MAX,0]]);
++    // Pure red then pure blue, ranks 0,1,2,3 in raster order.
++    let known=cases.len();
++    cases.push([31,31<<16,0xe4e4e4e4,0]);
++    for pixel in 0..16 {
++        for rank in 1..=3 {cases.push([0,0,rank<<(2*pixel),0]);}
++    }
++    for component in 0..6 {
++        let mut input=[0u32;4];
++        input[component/3]=1<<(8*(component%3));
++        cases.push(input);
++    }
++    let mut counts=std::collections::BTreeMap::new();
++    run_bc1_cases(&shader,&cases,|backend,i,input,got| {
++        let [a,b,ranks,_]=input;
++        let mut ep=[0;6];
++        ep[..3].copy_from_slice(&a.to_le_bytes()[..3]);
++        ep[3..].copy_from_slice(&b.to_le_bytes()[..3]);
++        let ix:[u8;16]=std::array::from_fn(|p| ((ranks>>(2*p))&3) as u8);
++        let mut expected=[0u8;8];
++        bc1_color(&ep,&ix,&mut expected);
++        if i==known {assert_eq!(got,[0x001ff800,0x78787878]);}
++        assert_eq!([got[0].to_le_bytes(),got[1].to_le_bytes()].concat(),expected,"{backend} case {i}");
++        *counts.entry(backend.to_string()).or_insert(0usize)+=1;
++    });
++    assert!(!counts.is_empty() && counts.values().all(|&n| n==cases.len()));
++    eprintln!("BC1 blocks checked: {counts:?}");
++}

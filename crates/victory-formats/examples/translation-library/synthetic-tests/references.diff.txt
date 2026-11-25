@@ -1,0 +1,77 @@
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 3bf9d61..a733b7c 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -1747,3 +1747,72 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
+         refused.err()
+     );
+ }
++
++#[test]
++fn vic115_bcpack_references() {
++    fn references(s: &[u8], paired: bool) -> (usize, usize) {
++        let (d, ix) = if paired {
++            (interleave(s[0], s[1]), interleave(s[2], s[3]))
++        } else {
++            (s[0], s[1])
++        };
++        let delta = (d >> 1) ^ (d & 1).wrapping_neg();
++        (usize::from(ix.wrapping_add(delta)), usize::from(ix))
++    }
++    
++    /// Two 4-bit symbols, the first on the even bits.
++    fn interleave(a: u8, b: u8) -> u8 {
++        let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
++        spread(a) | spread(b) << 1
++    }
++    // d and ix live in v5 and v6; the result packs ep_ref | (ix_ref << 8).
++    for paired in [false, true] {
++        let mut body = Vec::new();
++        if paired {
++            for (dst, first) in [(5u8,1u8),(6,3)] {
++                body.push(vop1(1,dst,128));
++                for bit in 0..4u16 {
++                    for symbol in 0..2u8 {
++                        body.extend(vop3(0x148,7,vgpr(first+symbol),128+bit,129));
++                        body.extend(vop3(0x36f,dst,vgpr(7),128+2*bit+u16::from(symbol),vgpr(dst)));
++                    }
++                }
++            }
++        } else {
++            body.push(vop1(1,5,vgpr(1)));
++            body.push(vop1(1,6,vgpr(2)));
++        }
++        // Signed extraction of a single bit produces the zigzag sign mask.
++        body.extend(vop3(0x149,7,vgpr(5),128,129));
++        body.extend(vop3(0x148,8,vgpr(5),129,135)); // d >> 1 (seven bits)
++        let vop2 = |op:u32, dst:u8, a:u16, b:u8| op<<25 | u32::from(dst)<<17 | u32::from(b)<<9 | u32::from(a);
++        body.push(vop2(0x1d,8,vgpr(7),8)); // xor
++        body.push(vop2(0x25,8,vgpr(8),6)); // add index
++        body.extend(vop3(0x148,8,vgpr(8),128,136)); // wrapping u8
++        body.extend(vop3(0x36f,0,vgpr(6),136,vgpr(8)));
++        let shader=build_valu_cs(&body);
++        let name=if paired {"paired"} else {"direct"};
++        if let Some(dir)=std::env::var_os("BCPACK_SHADER_OUTPUT") {
++            let dir=std::path::Path::new(&dir);
++            std::fs::write(dir.join(format!("{name}.dxil")),&shader.dxil).unwrap();
++            let words:Vec<u8>=body.iter().flat_map(|w| w.to_le_bytes()).collect();
++            std::fs::write(dir.join(format!("{name}.rdna2")),words).unwrap();
++        }
++        let compact=|v:u32| (0..4).fold(0,|acc,k| acc|((v>>(2*k))&1)<<k);
++        let mut cases=Vec::new();
++        for d in 0..256 {
++            for ix in [0,255,(d*73+19)&255] {
++                let input=if paired {[compact(d),compact(d>>1),compact(ix),compact(ix>>1)]} else {[d,ix,0,0]};
++                cases.push(input);
++            }
++        }
++        let mut counts=std::collections::BTreeMap::new();
++        run_cases(&shader,&cases,|backend,_,input,got| {
++            let (ep,ix)=references(&input.map(|n| n as u8),paired);
++            assert_eq!(got, (ep | ix<<8) as u32, "{backend} {name} {input:?}");
++            *counts.entry(backend.to_owned()).or_insert(0usize)+=1;
++        });
++        assert!(!counts.is_empty() && counts.values().all(|&n| n==cases.len()));
++        eprintln!("{name}: {counts:?}");
++    }
++}

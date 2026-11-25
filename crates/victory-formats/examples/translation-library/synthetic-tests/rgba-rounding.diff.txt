@@ -1,0 +1,66 @@
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -1625,10 +1625,10 @@
+             words.extend([0xBA80_0881u32, 3]);
+         }
+         for (dst, ch, omod, clamp) in [
+-            (2u32, 0u32, 3u32, false),
+-            (3, 1, 1, false),
+-            (4, 2, 2, false),
+-            (5, 3, 3, true),
++            (2u32, 0u32, 2u32, false),
++            (3, 1, 3, false),
++            (4, 2, 1, true),
++            (5, 3, 0, true),
+         ] {
+             // v_interp_p1_f32 v6, v0, attr0.<ch>
+             words.push(0xC800_0000 | (6 << 18) | (ch << 8));
+@@ -1660,7 +1660,7 @@
+     /// overflow/subnormal rounding and `legacyF32ToF16` rounding drift.
+     #[cfg(windows)]
+     #[test]
+-    fn v_interp_p2_f16_modifiers_narrow_once_in_mode16() {
++    fn vic113_translate_rgba() {
+         use super::host::{Draw, Host};
+ 
+         let _one = super::valu_tests::ONE_AT_A_TIME
+@@ -1698,14 +1698,11 @@
+             v.validate(&mut vs).unwrap();
+         }
+ 
+-        // ch0: 98304.0 * 0.5 -> 49152.0 (0x7A00), would overflow if narrowed first
+-        // ch1: 32768.0 * 2.0 -> 65536.0 (0x7C00 RNE, 0x7BFF RTZ)
+-        // ch2: (2^-15 + 2^-25) * 4.0 -> 0x0801, would double-round to 0x0800
+-        // ch3: clamp((2^-14 + 3*2^-24) * 0.5) -> 0x0202 RNE, 0x0201 RTZ
+-        let c0 = 98304.0f32;
+-        let c1 = 32768.0f32;
+-        let c2 = f32::from_bits(0x3800_2000);
+-        let c3 = f32::from_bits(0x3880_6000);
++        // Synthetic RGBA: scale R by 4, G by 1/2, saturate(2*B), saturate(A).
++        let c0 = -16384.0f32;
++        let c1 = -f32::from_bits(0x33800000);
++        let c2 = 0.2503662109375f32;
++        let c3 = 1.25f32;
+         #[rustfmt::skip]
+         let vertices = [
+             -1.0, -1.0, 0.5, 1.0, c0, c1, c2, c3,
+@@ -1721,8 +1718,8 @@
+             };
+             let root = host.root_signature_for(&[]).unwrap();
+             for (rtz, want) in [
+-                (false, [0x7A00u32, 0x7C00, 0x0801, 0x0202]),
+-                (true, [0x7A00u32, 0x7BFF, 0x0801, 0x0201]),
++                (false, [0xfc00u32, 0x8000, 0x3802, 0x3c00]),
++                (true, [0xfbffu32, 0x8000, 0x3801, 0x3c00]),
+             ] {
+                 let ps = interp_p2_f16_modifier_ps(rtz).unwrap();
+                 let pso = host
+@@ -1745,7 +1742,7 @@
+                     .unwrap_or_else(|e| panic!("{label} rtz={rtz}: draw: {e}"));
+                 assert_eq!(texels.len(), 4);
+                 for (i, &texel) in texels.iter().enumerate() {
+-                    let got = texel.map(|x| x as u32);
++                    let got = texel.map(|x| x as u32); if i==0 {eprintln!("{label} rtz={rtz} {got:04x?}");}
+                     assert_eq!(
+                         got, want,
+                         "{label} rtz={rtz} texel {i}: got {got:#06x?}, want {want:#06x?} (raw {texel:?})"
