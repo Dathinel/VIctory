@@ -525,6 +525,16 @@ impl Module {
             .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
     }
 
+    /// Whether any module constant is a 32-bit integer with value `v`
+    /// (the signed form [`Module::i32`] stores).
+    #[cfg(test)]
+    pub(crate) fn has_i32_const(&self, v: i64) -> bool {
+        self.consts.iter().any(|(ty, c)| {
+            matches!(self.types[ty.0 as usize], TypeDef::Int(32))
+                && matches!(c, Const::Int(n) if *n == v)
+        })
+    }
+
     /// Start from instructions that must execute and from externally used
     /// values. The worklist keeps their operands, including loop-carried phis.
     fn live(&self, omit_unused_math: bool) -> Vec<bool> {

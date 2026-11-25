@@ -1083,6 +1083,10 @@ impl State {
         let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host() else {
             return;
         };
+        // Off-element aligned copies and other special buffer views are not
+        // textures; refresh them every ResourceHeap draw/dispatch so heap-
+        // indexed SRVs see title writes (#553).
+        host.refresh_special_buffers(list);
         let targets_hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2315,6 +2319,15 @@ fn readable(
             shadow.gpu_writes(list, address, len);
         } else {
             shadow.refresh(list, address, len);
+        }
+        // A shader view off its buffer copy's elements reads its own copy of
+        // just its bytes: that one is a host copy like any other, so its own
+        // refresh brings it up to date from title memory (which the last
+        // submission's copy-back already wrote).
+        if u.kind == ResourceType::Srv
+            && let Some(aligned) = crate::shadow::aligned_existing(address, len)
+        {
+            aligned.refresh(list, address, len);
         }
     }
     match (view, u.kind) {

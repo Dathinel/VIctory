@@ -326,10 +326,97 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     (format != own && format != target_format(own)).then_some(own)
 }
 
+/// Dimension, depth-or-array size, and sample count for a NULL-desc RTV/DSV
+/// when the host copy is typeless ([`view_format`] is `Some`).
+#[cfg(windows)]
+pub(crate) fn view_shape(this: This) -> Option<(u32, u16, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let d = &resource(this).desc;
+    Some((d.dimension, d.depth_or_array_size, d.sample_count.max(1)))
+}
+
 /// Depth formats with their typeless family: depth textures that shaders
 /// read are made typeless on the host, which only allows views of
 /// typeless depth resources.
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
+
+/// Default concrete format for a typeless DXGI family. Depth multi-plane,
+/// block-compressed, and 96-bit `R32G32B32` allow shader views only
+/// (`None` when `unordered`). Device-specific typed-UAV support is the
+/// caller's to check.
+pub(crate) fn typeless_default_format(typeless: u32, unordered: bool) -> Option<u32> {
+    // DXGI_FORMAT numbers: typeless → a common concrete member of the family.
+    match typeless {
+        // R24G8_TYPELESS → R24_UNORM_X8_TYPELESS
+        44 => (!unordered).then_some(46),
+        // R32G8X24_TYPELESS → R32_FLOAT_X8X24_TYPELESS
+        19 => (!unordered).then_some(21),
+        // BC1..BC7 typeless → UNORM / UF16 (SRV only)
+        70 => (!unordered).then_some(71),
+        73 => (!unordered).then_some(74),
+        76 => (!unordered).then_some(77),
+        79 => (!unordered).then_some(80),
+        82 => (!unordered).then_some(83),
+        94 => (!unordered).then_some(95),
+        97 => (!unordered).then_some(98),
+        // R32G32B32_TYPELESS → FLOAT (no typed UAV in D3D12)
+        5 => (!unordered).then_some(6),
+        // Color typeless → FLOAT / UNORM defaults
+        1 => Some(2),   // R32G32B32A32
+        9 => Some(10),  // R16G16B16A16
+        15 => Some(16), // R32G32
+        23 => Some(24), // R10G10B10A2
+        27 => Some(28), // R8G8B8A8
+        33 => Some(34), // R16G16
+        39 => Some(41), // R32
+        48 => Some(49), // R8G8
+        53 => Some(54), // R16
+        60 => Some(61), // R8
+        90 => Some(87), // B8G8R8A8
+        92 => Some(88), // B8G8R8X8
+        _ => None,
+    }
+}
+
+/// Concrete format for a null or `DXGI_FORMAT_UNKNOWN` SRV/UAV of a typeless
+/// host texture. `title` is the console format when the host copy was promoted
+/// from a typed resource (depth without deny-shader, or sRGB with UAV); `None`
+/// when the title created the resource typeless. Maps sRGB → linear for UAVs
+/// and depth → an SRV-capable plane format. (#438 VIC-BT-004)
+pub(crate) fn null_view_format(
+    host_typeless: u32,
+    title: Option<u32>,
+    unordered: bool,
+) -> Option<u32> {
+    const D16_UNORM: u32 = 55;
+    const R16_UNORM: u32 = 56;
+    if let Some(fmt) = title {
+        if unordered {
+            let linear = SRGB
+                .iter()
+                .find(|&&(srgb, _)| srgb == fmt)
+                .map(|&(_, linear)| linear)
+                .unwrap_or(fmt);
+            if DEPTH_FORMATS
+                .iter()
+                .any(|&(typed, _)| typed == linear || typed == fmt)
+            {
+                return None;
+            }
+            return Some(linear);
+        }
+        if fmt == D16_UNORM {
+            return Some(R16_UNORM);
+        }
+        if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == fmt) {
+            return typeless_default_format(host_typeless, false);
+        }
+        return Some(fmt);
+    }
+    typeless_default_format(host_typeless, unordered)
+}
 
 /// Mip levels, the full chain for 0.
 fn mip_count(desc: &ResourceDesc) -> u32 {
@@ -1000,8 +1087,10 @@ fn host_texture(
         let mut trial = d;
         trial.flags = flags;
         let initial = crate::host::legal_for(flags, wanted);
-        // A clear value is only legal on render targets and depth.
-        let try_clear = clear_value.filter(|_| keep_clear && flags & (RENDER_TARGET | DEPTH) != 0);
+        // A clear value is only legal on render targets and depth
+        // (VIC-BT-022): a non-null pOptimizedClearValue with neither flag
+        // is E_INVALIDARG on PC D3D12.
+        let try_clear = optimized_clear(flags, keep_clear, clear_value);
         // Permissions that leave the description unchanged are not asked twice.
         if tried.contains(&(flags, initial, try_clear)) {
             continue;
@@ -1075,19 +1164,31 @@ fn host_texture(
     Some((texture, initial))
 }
 
+/// PC D3D12 accepts `pOptimizedClearValue` only when the resource may be a
+/// render target or a depth stencil. Passing a non-null clear with neither
+/// flag (or for a buffer) fails with `E_INVALIDARG`; console titles can
+/// still name a clear on resources whose host flags lose those bits.
+#[cfg(any(windows, test))]
+fn optimized_clear(flags: u32, keep: bool, clear: Option<[u32; 5]>) -> Option<[u32; 5]> {
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    clear.filter(|_| keep && flags & (RENDER_TARGET | DEPTH) != 0)
+}
+
 /// The (flags, state, whether the clear value is kept) triples to try for a
 /// host texture, most faithful first: what the title asked for, then in the
 /// common state, then without the clear value, then without the permissions
 /// the host may refuse. A texture the host cannot make as asked still exists
 /// for the draws that read it; the log names what was lost. Nothing is
-/// tried twice, permissions only go down, and a depth target keeps its
-/// depth permission.
+/// tried twice, permissions only go down, a depth target keeps its depth
+/// permission, and `keep_clear` is false when the flags cannot take a clear.
 #[cfg(any(windows, test))]
 fn attempts(flags: u32, state: u32) -> Vec<(u32, u32, bool)> {
     const UNORDERED: u32 = 4;
     const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
     let mut out: Vec<(u32, u32, bool)> = Vec::with_capacity(7);
-    for triple in [
+    for (f, s, keep) in [
         (flags, state, true),
         (flags, 0, true),
         (flags, state, false),
@@ -1096,6 +1197,8 @@ fn attempts(flags: u32, state: u32) -> Vec<(u32, u32, bool)> {
         (flags & !UNORDERED, 0, false),
         (flags & !UNORDERED & !RENDER_TARGET, 0, false),
     ] {
+        // Never advertise a clear the host would refuse (VIC-BT-022).
+        let triple = (f, s, keep && f & (RENDER_TARGET | DEPTH) != 0);
         if !out.contains(&triple) {
             out.push(triple);
         }
@@ -1764,7 +1867,8 @@ mod tests {
 
     #[test]
     fn nothing_is_tried_twice() {
-        assert_eq!(attempts(0, 0), [(0, 0, true), (0, 0, false)]);
+        // Flags with neither RT nor DS never keep a clear (VIC-BT-022).
+        assert_eq!(attempts(0, 0), [(0, 0, false)]);
         for flags in 0..16 {
             for state in [0, 4, 0x10] {
                 let tries = attempts(flags, state);
@@ -1779,6 +1883,34 @@ mod tests {
     fn a_depth_target_keeps_its_depth_permission() {
         for flags in [2, 3, 6, 7, 10] {
             assert!(attempts(flags, 0x10).iter().all(|&(f, _, _)| f & 2 != 0));
+        }
+    }
+
+    /// VIC-BT-022: PC CreateCommittedResource rejects a non-null optimized
+    /// clear unless ALLOW_RENDER_TARGET or ALLOW_DEPTH_STENCIL is set.
+    #[test]
+    fn optimized_clear_needs_render_target_or_depth() {
+        let clear = Some([28u32, 0, 0, 0, 0]); // DXGI_FORMAT_R8G8B8A8_UNORM
+        assert!(optimized_clear(0, true, clear).is_none());
+        assert!(optimized_clear(4, true, clear).is_none()); // UAV only
+        assert!(optimized_clear(8, true, clear).is_none()); // deny shader
+        assert!(optimized_clear(1, true, clear).is_some()); // RT
+        assert!(optimized_clear(2, true, clear).is_some()); // depth
+        assert!(optimized_clear(3, true, clear).is_some()); // RT|depth
+        assert!(optimized_clear(5, true, clear).is_some()); // RT|UAV
+        assert!(optimized_clear(1, false, clear).is_none());
+        assert!(optimized_clear(1, true, None).is_none());
+        // Ladder steps without RT/DS must not advertise a kept clear.
+        for &(f, _, keep) in &attempts(4, 0) {
+            assert!(
+                !keep || f & 3 != 0,
+                "UAV-only ladder kept clear at flags {f:#x}"
+            );
+            assert!(optimized_clear(f, keep, clear).is_none() || f & 3 != 0);
+        }
+        for &(f, _, keep) in &attempts(0, 4) {
+            assert!(!keep);
+            assert!(optimized_clear(f, keep, clear).is_none());
         }
     }
 
@@ -2017,6 +2149,64 @@ mod tests {
     #[test]
     fn a_missing_resource_has_no_default_view_format() {
         assert_eq!(view_format(std::ptr::null()), None);
+    }
+
+    /// Null / UNKNOWN SRV and UAV formats for typeless host copies, including
+    /// textures `host_texture` promotes from typed console formats (VIC-BT-004).
+    #[test]
+    fn null_view_formats_for_typeless_and_promoted_textures() {
+        const R8G8B8A8_TYPELESS: u32 = 27;
+        const R8G8B8A8_UNORM: u32 = 28;
+        const R8G8B8A8_UNORM_SRGB: u32 = 29;
+        const R32_TYPELESS: u32 = 39;
+        const D32_FLOAT: u32 = 40;
+        const R32_FLOAT: u32 = 41;
+        const R24G8_TYPELESS: u32 = 44;
+        const D24_UNORM_S8_UINT: u32 = 45;
+        const R24_UNORM_X8_TYPELESS: u32 = 46;
+        const R16_TYPELESS: u32 = 53;
+        const D16_UNORM: u32 = 55;
+        const R16_UNORM: u32 = 56;
+
+        // Title-created typeless: inherit a family default.
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, None, false),
+            Some(R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, None, true),
+            Some(R8G8B8A8_UNORM)
+        );
+        assert_eq!(null_view_format(R24G8_TYPELESS, None, true), None);
+
+        // sRGB + UAV promotes to typeless: SRV keeps sRGB, UAV is linear.
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, Some(R8G8B8A8_UNORM_SRGB), false),
+            Some(R8G8B8A8_UNORM_SRGB)
+        );
+        assert_eq!(
+            null_view_format(R8G8B8A8_TYPELESS, Some(R8G8B8A8_UNORM_SRGB), true),
+            Some(R8G8B8A8_UNORM)
+        );
+
+        // Depth without deny-shader promotes to typeless: SRV uses a plane format.
+        assert_eq!(
+            null_view_format(R32_TYPELESS, Some(D32_FLOAT), false),
+            Some(R32_FLOAT)
+        );
+        assert_eq!(
+            null_view_format(R24G8_TYPELESS, Some(D24_UNORM_S8_UINT), false),
+            Some(R24_UNORM_X8_TYPELESS)
+        );
+        assert_eq!(
+            null_view_format(R16_TYPELESS, Some(D16_UNORM), false),
+            Some(R16_UNORM)
+        );
+        assert_eq!(
+            null_view_format(R32_TYPELESS, Some(D32_FLOAT), true),
+            None,
+            "depth has no typed UAV"
+        );
     }
 
     #[test]
@@ -2438,6 +2628,11 @@ void main() {
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
+    ///
+    /// Exercises buffer→texture staging via `defer_fill` (host-owned mapped
+    /// upload). Under Wine+vkd3d that path must not use `defer_copy`, or
+    /// `VirtualQuery` reporting Map memory as MEM_FREE skips the upload and
+    /// this reads zeros (#518).
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {

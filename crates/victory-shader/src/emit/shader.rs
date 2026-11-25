@@ -75,6 +75,12 @@ pub(crate) struct Shader {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// Test builds: d16 format loads that kept the destination's high half.
+    #[cfg(test)]
+    pub d16_kept_high_halves: u32,
+    /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
+    #[cfg(test)]
+    pub smem_buffer_bytes: Vec<u32>,
     /// Test builds: indices into the address list of image instructions that
     /// were read.
     #[cfg(test)]
@@ -139,8 +145,11 @@ impl Shader {
         Shader {
             m,
             #[cfg(test)]
-            #[cfg(test)]
             unaligned_typed_loads: 0,
+            #[cfg(test)]
+            d16_kept_high_halves: 0,
+            #[cfg(test)]
+            smem_buffer_bytes: Vec::new(),
             #[cfg(test)]
             image_address_reads: Vec::new(),
             t: Types {
