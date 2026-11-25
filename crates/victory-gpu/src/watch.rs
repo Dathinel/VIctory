@@ -43,6 +43,16 @@ struct Journal {
     kept: bool,
 }
 
+impl Journal {
+    /// Refreshes overlapping an announced file read must ask the kernel
+    /// again, even when a previous query covered their pages.
+    fn forget_ahead(&mut self, (first, last): (usize, usize)) {
+        const _: () = assert!(BLOCK == PAGE);
+        self.ahead.retain(|&(a, b)| b <= first || last <= a);
+        self.kept = !self.ahead.is_empty();
+    }
+}
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
@@ -146,6 +156,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // Snapshot before the kernel queries. A read already in progress may
+    // complete while they run. A newly announced read takes this journal
+    // lock and invalidates its range before the caller starts writing.
+    let pending: Vec<_> = guards().announced.keys().copied().collect();
     j.ahead.clear();
     j.kept = false;
     j.asked += 1;
@@ -174,6 +188,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
     }
     j.kept = !j.ahead.is_empty();
+    for range in pending {
+        j.forget_ahead(range);
+    }
 }
 
 /// Ends the active per-submission coalesced asking so later [`writes`] calls
@@ -564,11 +581,12 @@ pub(crate) fn writing(at: usize, len: usize) {
 /// and the read would fail.
 pub fn kernel_will_write(at: usize, len: usize) {
     let end = at.saturating_add(len);
+    let range = (at / BLOCK, end.div_ceil(BLOCK));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
     open(&mut g, at, end);
-    *g.announced
-        .entry((at / BLOCK, end.div_ceil(BLOCK)))
-        .or_default() += 1;
+    *g.announced.entry(range).or_default() += 1;
+    j.forget_ahead(range);
 }
 
 /// The kernel write [`kernel_will_write`] announced for `[at, at + len)`
@@ -1132,6 +1150,53 @@ mod tests {
                 j.written.remove(&page);
             }
         }
+    }
+
+    #[test]
+    fn a_file_read_after_the_submission_query_reaches_every_reader() {
+        use std::io::{Read, Seek, Write};
+        // SAFETY: allocate a writable page and release it after all reads.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"texel").unwrap();
+        for already_announced in [false, true] {
+            let (before, _) = writes(at, at + PAGE, false).unwrap();
+            if already_announced {
+                kernel_will_write(at, 5);
+            }
+            ask_once(&[(at, at + PAGE)]);
+            if !already_announced {
+                kernel_will_write(at, 5);
+            }
+            file.rewind().unwrap();
+            // SAFETY: these five bytes belong to the committed allocation.
+            let dest = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 5) };
+            file.read_exact(dest).unwrap();
+            assert_eq!(dest, b"texel");
+            // An overlapped read can still have an open announcement when a
+            // refresh runs. Another reader can ask after completion.
+            for finished in [false, true] {
+                if finished {
+                    kernel_wrote(at, 5);
+                }
+                let (_, pages) = writes(at, at + PAGE, false).unwrap();
+                assert!(
+                    pages.iter().any(|&(p, w)| p == at / PAGE && w > before),
+                    "already_announced={already_announced}, finished={finished}"
+                );
+            }
+            ask_once_end();
+        }
+        // SAFETY: the reservation is ours.
+        unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
     }
 
     #[test]
