@@ -1998,3 +1998,35 @@ fn bcpack_zigzag_decode_matches_the_formats_function() {
         assert_eq!(got, want[i], "{backend}: zz{inputs:?}");
     });
 }
+
+/// `victory_formats::bcpack::bc6_index_bits`, the function the test below runs as console
+/// code.
+fn bc6_index_bits_reference(mode: u8) -> u8 {
+    match mode {
+        1..=10 => 3,
+        11..=14 => 4,
+        _ => 0,
+    }
+}
+
+/// BC6H's index width for a mode, written as console code, matches the formats crate's
+/// function on the GPU for every byte.
+#[test]
+fn bcpack_bc6_index_width_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the mode. Two range tests as unsigned compares of the mode less the range's start.
+    body.extend(vop3(0x125, 5, 193, vgpr(1), 128)); // v_add_nc_u32 v5, -1, v1
+    body.extend(vop3(0x0C4, 106, 128 + 10, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 10, v5
+    body.extend(vop3(0x101, 6, 128, 128 + 3, vcc)); // v_cndmask_b32 v6, 0, 3, vcc
+    body.extend(vop3(0x126, 5, vgpr(1), 128 + 11, 128)); // v_sub_nc_u32 v5, v1, 11
+    body.extend(vop3(0x0C4, 106, 128 + 4, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 4, v5
+    body.extend(vop3(0x101, 7, 128, 128 + 4, vcc)); // v_cndmask_b32 v7, 0, 4, vcc
+    body.extend(vop3(0x11C, 0, vgpr(6), vgpr(7), 128)); // v_or_b32 v0, v6, v7
+    let shader = build_valu_cs(&body);
+    let cases: Vec<[u32; 4]> = (0u32..256).map(|mode| [mode, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let want = u32::from(bc6_index_bits_reference(inputs[0] as u8));
+        assert_eq!(got, want, "{backend}: bc6_index_bits({})", inputs[0]);
+    });
+}
