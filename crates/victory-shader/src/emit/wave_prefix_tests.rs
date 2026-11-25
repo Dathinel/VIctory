@@ -845,6 +845,7 @@ fn wave_prefix_sum_f32_pixel_quad_all_backends() {
         io: StageIo::Ps {
             inputs: Vec::new(),
             input_addr: 0,
+            rsrc2: Default::default(),
             db_shader_control: 0,
             patches: Vec::new(),
         },

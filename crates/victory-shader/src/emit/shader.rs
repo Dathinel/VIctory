@@ -75,6 +75,16 @@ pub(crate) struct Shader {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// Test builds: d16 loads that kept the destination VGPR's high half.
+    #[cfg(test)]
+    pub d16_kept_high_halves: u32,
+    /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
+    #[cfg(test)]
+    pub smem_buffer_bytes: Vec<u32>,
+    /// Test builds: indices into the address list of image instructions that
+    /// were read.
+    #[cfg(test)]
+    pub image_address_reads: Vec<usize>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -135,8 +145,13 @@ impl Shader {
         Shader {
             m,
             #[cfg(test)]
-            #[cfg(test)]
             unaligned_typed_loads: 0,
+            #[cfg(test)]
+            d16_kept_high_halves: 0,
+            #[cfg(test)]
+            smem_buffer_bytes: Vec::new(),
+            #[cfg(test)]
+            image_address_reads: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -391,6 +406,26 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// Omit unread user semantics from a translated pixel shader so an upstream
+    /// mesh shader can spend its output budget on what the pixel shader reads.
+    pub(super) fn prune_pixel_inputs(&mut self) {
+        if !self.pixel || !self.inputs.iter().any(|e| e.kind == 0 && e.usage == 0) {
+            return;
+        }
+        let mut remap = std::collections::HashMap::new();
+        let mut next = 0u32;
+        for (index, element) in self.inputs.iter().enumerate() {
+            if element.kind != 0 || element.usage != 0 {
+                if index as u32 != next {
+                    remap.insert(self.m.i32(index as u32), self.m.i32(next));
+                }
+                next += 1;
+            }
+        }
+        self.m.remap_input_loads(&remap);
+        self.inputs.retain(|e| e.kind != 0 || e.usage != 0);
     }
 
     /// The finished container.

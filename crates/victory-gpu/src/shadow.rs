@@ -145,8 +145,20 @@ impl Shadow {
         address - self.start
     }
 
+    /// `len` bytes at a title address from the host copy, for the log: the
+    /// bytes the copy holds, as of its last refresh (None outside the buffer).
+    pub(crate) fn bytes(&self, address: u64, len: u64) -> Option<&[u8]> {
+        if address < self.start || len == 0 || len > self.left(address) {
+            return None;
+        }
+        let at = usize::try_from(address - self.start).ok()?;
+        let len = usize::try_from(len).ok()?;
+        // SAFETY: inside the mapping, which is as long as the buffer.
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(at), len) })
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
-    /// and keeps the copy alive until the list is reset.
+    /// and keeps the copy alive until the list is reset. Cut to the copy.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         self.refresh_as(list, address, len, D3D12_RESOURCE_STATE_GENERIC_READ);
     }
@@ -160,8 +172,17 @@ impl Shadow {
         access: D3D12_RESOURCE_STATES,
     ) {
         list.use_shadow(&self.buffer, access);
-        let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        let from = address.max(self.start);
+        let len = range_inside(
+            from,
+            len.saturating_sub(from.saturating_sub(address)),
+            self.start,
+            self.len,
+        );
+        if len == 0 {
+            return;
+        }
+        list.defer_refresh(self, from as usize, len as usize);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -440,6 +461,19 @@ impl Shadow {
     }
 }
 
+/// A refresh that copies none of its range is skipped: the writes it was
+/// asked about were already in the copy, the range is outside the buffer,
+/// or shaders were still writing all of it (that part is left to a later
+/// refresh). Counted for the frame-rate line as one skipped refresh of
+/// `len` bytes, so `0 skipped` there means no refresh was answered
+/// without a copy, not that nothing was checked. A range copied in part is
+/// not skipped; of what it did not copy, `unchanged` counts only the parts
+/// this refresh checked, not the sub-ranges shaders still write.
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) fn skipped(len: usize, copied: usize) -> Option<u64> {
+    (len > 0 && copied == 0).then_some(len as u64)
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -517,6 +551,31 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// The copy of the innermost title buffer holding `[address, address +
+/// len)`, if one has already been made: the same lookup as [`find`] without
+/// making a copy, for paths that must not allocate one.
+pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    let shadow = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .and_then(|(_, e)| e.shadow.clone());
+    if shadow.is_some() {
+        return shadow;
+    }
+    drop(map);
+    let start = address & !(WINDOW - 1);
+    let len = end.next_multiple_of(WINDOW) - start;
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(start, len))
+        .cloned()
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
@@ -526,6 +585,86 @@ const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// Copies of just one view's bytes, by (start, length): for a view whose
+/// start is not on an element of its host copy (`aligned`). The heap slot
+/// holds the copy; this map only finds it again, so it holds weak references
+/// and the copy goes when the slot is remade.
+static ALIGNED: Mutex<BTreeMap<(u64, u64), std::sync::Weak<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// A copy of `[address, address + len)` that starts at `address` itself, so a
+/// structured view of it can have its elements where the title put them.
+///
+/// A title aligns a resource; the host copy of a buffer starts where the
+/// buffer does, so a view of memory the title placed inside another object
+/// (`View::Placed`) starts at an offset that need not be a multiple of the
+/// view's stride. This copy starts at the view, and the slot that made it
+/// keeps it alive.
+///
+/// Its own refresh copies the 64 KiB pages the title wrote since they were
+/// last copied, straight from title memory: a submission's copy-back runs
+/// before the next submission prepares (`Host::execute` waits for the GPU
+/// before copying back), so by then title memory holds what the GPU wrote in
+/// any copy, and what shaders wrote in this one has gone back there. Copying
+/// from the buffer's copy instead would copy the view's whole range again on
+/// every submission.
+pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    let key = (address, len);
+    if let Some(copy) = aligned_existing(address, len) {
+        return Some(copy);
+    }
+    // Views hold hundreds of megabytes in the world; made as a buffer's copy
+    // is, so that shaders may write it (unordered access).
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(64))?;
+    crate::host::name(&buffer, || format!("aligned view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let copy = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    // Populate now so a ResourceHeap-only first use (which never walks the
+    // table refresh path) still sees title memory rather than zeros (#553).
+    // SAFETY: `data` is the mapping of `buffer`; `address` is title memory
+    // of `len` bytes the view was created for.
+    crate::host::copy_mapped(data, address as *const u8, len as usize, false);
+    {
+        let mut copies = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+        // Drop expired weaks so distinct (address, len) churn cannot grow
+        // the map without bound (docs/code-standards.md host-cache bound).
+        copies.retain(|_, weak| weak.strong_count() > 0);
+        // Another recorder may have published the same range while we allocated.
+        if let Some(existing) = copies.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Some(existing);
+        }
+        copies.insert(key, Arc::downgrade(&copy));
+    }
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        len,
+        "aligned view copy made"
+    );
+    Some(copy)
+}
+
+/// The copy `aligned` made for this range, if one is still alive.
+pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    ALIGNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, len))
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// How many bytes of `[address, address + len)` lie inside the copy that
+/// starts at `start` of `size` bytes: what a refresh of that copy can bring up
+/// to date. `0` when the range is not inside it at all.
+fn range_inside(address: u64, len: u64, start: u64, size: u64) -> u64 {
+    let end = start.saturating_add(size);
+    let from = address.max(start);
+    let to = address.saturating_add(len).min(end);
+    to.saturating_sub(from)
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
@@ -562,6 +701,14 @@ pub(crate) fn near(va: u64) -> String {
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
+    all.extend(
+        ALIGNED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(|w| w.upgrade())
+            .map(|s| (s.gpu, s.start, s.len)),
+    );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
     let mut text = match below {
@@ -584,6 +731,78 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {
+        if crate::host::host().is_none() {
+            return;
+        }
+
+        const THREADS: usize = 8;
+        let values = [[19u32; 14]; 8];
+        for value in &values {
+            let address = value.as_ptr() as u64;
+            let len = size_of_val(value) as u64;
+            let gate = std::sync::Barrier::new(THREADS);
+            let copies = std::thread::scope(|scope| {
+                let jobs: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let gate = &gate;
+                        scope.spawn(move || {
+                            gate.wait();
+                            aligned(address, len).expect("aligned host buffer")
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| job.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let refreshed = aligned_existing(address, len).expect("cached copy");
+            refreshed.update(address as usize, len as usize);
+            for copy in copies {
+                assert!(
+                    Arc::ptr_eq(&copy, &refreshed),
+                    "slot retained a different copy"
+                );
+                // SAFETY: the mapped buffer has 56 bytes and refresh has completed.
+                let first = unsafe { copy.data.cast::<u32>().read_unaligned() };
+                assert_eq!(first, value[0]);
+            }
+        }
+    }
+
+    /// A refresh of the aligned copy brings up to date the bytes of the view
+    /// that lie inside it, cut at both ends, and nothing when the range is
+    /// outside it.
+    #[test]
+    fn a_refresh_covers_the_views_bytes_inside_its_copy() {
+        // The hit-detection view: 3136 bytes of 56-byte elements, 48 bytes
+        // into its buffer, in a copy that starts at the view.
+        assert_eq!(range_inside(0x3000_0030, 3136, 0x3000_0030, 3136), 3136);
+        // A view reaching past its copy is cut to it.
+        assert_eq!(range_inside(0x4000_0100, 900, 0x4000_0100, 0x100), 0x100);
+        // A view starting before its copy loses the part before it.
+        assert_eq!(range_inside(0x0ff8, 0x40, 0x1000, 0x1000), 0x38);
+        // Outside the copy at either end: nothing to refresh.
+        assert_eq!(range_inside(0x1000, 0x10, 0x2000, 0x100), 0);
+        assert_eq!(range_inside(0x20f0, 0x20, 0x1000, 0x100), 0);
+        // A size that would overflow does not.
+        assert_eq!(range_inside(u64::MAX - 8, 16, 0, 16), 0);
+    }
+
+    /// A refresh that copied nothing of its range is what the frame-rate
+    /// line's `skipped` counts; one that copied any part of it is not, and
+    /// an empty range is neither.
+    #[test]
+    fn a_refresh_that_copies_nothing_is_counted_as_skipped() {
+        assert_eq!(skipped(0, 0), None);
+        assert_eq!(skipped(4 << 20, 0), Some(4 << 20));
+        assert_eq!(skipped(4 << 20, 1), None);
+        assert_eq!(skipped(4 << 20, 4 << 20), None);
+        // Nothing in the buffer: the range was outside it.
+        assert_eq!(skipped(4096, 0), Some(4096));
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
@@ -734,6 +953,35 @@ mod tests {
         assert_eq!(weak.strong_count(), 1);
         unregister(resource, start);
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bytes_reads_the_copy_inside_the_buffer_only() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0002_usize;
+        register(resource, start, data.len() as u64);
+        let shadow = find(start, 64).expect("shadow");
+        assert_eq!(shadow.bytes(start, 16).map(<[u8]>::len), Some(16));
+        assert_eq!(
+            shadow
+                .bytes(start + data.len() as u64 - 16, 16)
+                .map(<[u8]>::len),
+            Some(16),
+            "a range ending in the buffer's last bytes is inside it"
+        );
+        assert!(shadow.bytes(start - 4, 4).is_none(), "before the buffer");
+        assert!(
+            shadow.bytes(start + data.len() as u64 - 8, 16).is_none(),
+            "past the buffer"
+        );
+        assert!(shadow.bytes(start, 0).is_none(), "nothing to read");
+        unregister(resource, start);
     }
 
     #[cfg(windows)]
