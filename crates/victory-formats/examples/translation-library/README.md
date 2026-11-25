@@ -23,3 +23,4 @@ The synthetic-tests directory contains independent Rust fixture patches. Apply o
 - [Step one lane across a fragment boundary](bcpack-lane/README.md)
 - [Schedule multiple lanes and recover entropy records](bcpack-schedule/README.md)
 - [Decode a compressed stream into BC4 blocks](bc4-stream/README.md)
+- [Decode a compressed stream into BC3 blocks](bc3-stream/README.md)
