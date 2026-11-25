@@ -23,8 +23,10 @@
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
-//!   immediate sampler it uses has a comparison filter there (bit 0x80);
-//!   a heap sampler it uses must be a comparison sampler on the host.
+//!   immediate sampler used for comparison has a comparison filter there
+//!   (bit 0x80); the same console words used both ways get two slots so
+//!   annotateHandle matches `dx.resources`. A heap sampler used for
+//!   comparison must be a comparison sampler on the host.
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
@@ -78,9 +80,13 @@
 //!   declares and the rasterizer system values.
 
 mod bitcode;
+#[cfg(test)]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod half_src_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
@@ -88,6 +94,8 @@ mod lane_mask_tests;
 #[cfg(test)]
 mod lds_tests;
 mod lower;
+#[cfg(test)]
+mod mad_flush_tests;
 #[cfg(test)]
 mod mtbuf_tests;
 mod rect;
@@ -311,15 +319,28 @@ pub fn translate_with_view_strides(
     translate_program(container, allow_wave32, Some(view_stride))
 }
 
+/// A precompiled compute module (`FSPX`): only GFX10 code, no DXIL to start from.
+const FSPX_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
+    offset: 0,
+    what: "FSPX compute module",
+};
+
 fn translate_program(
     container: &[u8],
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
+    if container.starts_with(crate::dxbc::Fspx::MAGIC) {
+        return Err(FSPX_UNSUPPORTED);
+    }
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return Err(if c.fspx().is_some() {
+            FSPX_UNSUPPORTED
+        } else {
+            ShaderError::Malformed("no DXIL part")
+        });
+    };
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
@@ -749,6 +770,27 @@ mod tests {
     use super::{parse_loop_limit, parse_shader_opt};
 
     #[test]
+    fn fspx_modules_are_unsupported_not_missing_dxil() {
+        let fspx = crate::dxbc::Fspx::assemble(&[0; 28], &[], &[0x55; 8], &[]);
+        let wrapped = crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx)]);
+        for bytes in [&fspx, &wrapped] {
+            assert_eq!(
+                super::translate(bytes).unwrap_err(),
+                crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "FSPX compute module"
+                }
+            );
+        }
+        // Without an FSPX module it is still the missing DXIL part.
+        let plain = crate::dxbc::build(&[(crate::FourCC::ACCC, b"other")]);
+        assert_eq!(
+            super::translate(&plain).unwrap_err(),
+            crate::ShaderError::Malformed("no DXIL part")
+        );
+    }
+
+    #[test]
     fn the_shader_opt_switch_parses_or_falls_back() {
         let all = super::bitcode::opt::ALL;
         assert_eq!(parse_shader_opt(None), all);
@@ -852,6 +894,48 @@ mod tests {
         }
     }
 
+    /// `SPI_PS_INPUT_ADDR` bit 14 delivers the coverage mask in a VGPR. DXIL
+    /// reads it with `dx.op.coverage.i32`, and `SV_Coverage` is not a pixel
+    /// input there, so a console signature that lists it loses the element.
+    #[test]
+    fn pixel_sample_coverage_input_lowers_to_the_coverage_intrinsic() {
+        let mut coverage = varying("SV_Coverage", 0, 0);
+        coverage.kind = 14;
+        coverage.comp = 5;
+        coverage.row = None;
+        coverage.cols = 1;
+        let mut target = varying("SV_Target", 0, 3);
+        target.kind = 16;
+        let inputs = container::signature(&[coverage], true);
+        let outputs = container::signature(&[target], false);
+        let source = crate::dxbc::build(&[(FourCC::ISG1, &inputs), (FourCC::OSG1, &outputs)]);
+        let c = Container::parse(&source).unwrap();
+        // exp mrt0 v0, v0, v0, v0 (done); s_endpgm
+        let words = [0xF800_180Fu32, 0, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 14,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let host = translate_native(&c, &native, true, None, None).unwrap();
+        let c = Container::parse(&host.dxil).unwrap();
+        let inputs = signature_part(&c, FourCC::ISG1).unwrap();
+        assert!(inputs.iter().all(|e| e.kind != 14), "{inputs:?}");
+        #[cfg(windows)]
+        if let Some(mut v) = validator::Validator::for_test() {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
+
     #[test]
     fn oversized_mesh_keeps_only_exports_needed_by_its_pixel_shader() {
         use crate::native::{MeshIo, Usage, VsOutput};
@@ -903,10 +987,66 @@ mod tests {
                 ..
             })
         ));
-        let mut pixel = super::shader::Shader::new(true);
-        pixel.inputs = vec![varying("value", 8, 8), varying("value", 10, 9)];
-        pixel.m.terminate(pixel.entry, super::bitcode::Term::Ret);
-        let ps = pixel.finish();
+        // The pixel program declares all ten varyings but reads only the
+        // eighth and tenth. The translated loads must follow their new IDs.
+        let inputs: Vec<_> = (1..=10).map(|n| varying("value", n, n - 1)).collect();
+        let mut target = varying("SV_Target", 0, 0);
+        target.kind = 16;
+        let isg1 = container::signature(&inputs, true);
+        let target = container::signature(&[target], false);
+        let pixel_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &target)]);
+        let pixel = NativeProgram {
+            stage: HwStage::Ps,
+            vgprs: 4,
+            io: StageIo::Ps {
+                inputs: [7, 9]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(attr, row)| crate::native::PsInput {
+                        usage: Usage::Generic,
+                        row,
+                        mask: 15,
+                        attr: attr as u8,
+                        flat: true,
+                        fp16: false,
+                        pack2: false,
+                        row2: row,
+                    })
+                    .collect(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: [
+                0xC80A_0002u32, // v_interp_mov_f32 v2, p0, attr0.x
+                0xC80E_0402,    // v_interp_mov_f32 v3, p0, attr1.x
+                0xF800_180F,
+                0x0302_0302, // exp mrt0, v2, v3, v2, v3
+                0xBF81_0000,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+            ..native.clone()
+        };
+        let ps = translate_native(
+            &Container::parse(&pixel_bytes).unwrap(),
+            &pixel,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+        .dxil;
+        let consumer = Container::parse(&ps).unwrap();
+        assert_eq!(
+            signature_part(&consumer, FourCC::ISG1)
+                .unwrap()
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
+            [8, 10]
+        );
         let linked = translate_mesh_for_pixel(&c, &native, Some(&ps))
             .unwrap()
             .unwrap();

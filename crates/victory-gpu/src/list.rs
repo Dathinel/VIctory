@@ -128,6 +128,11 @@ struct List {
     has_work: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// `pInitialState` from CreateCommandList / Reset. On Windows the same
+    /// pointer lives in `state.pipeline`; this field covers the Create/Reset
+    /// wiring on hosts without a GPU.
+    #[cfg(not(windows))]
+    initial_pipeline: std::sync::atomic::AtomicUsize,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -178,6 +183,15 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// Updates draw state even when no host GPU / host list is available (so
+/// Create/Reset `pInitialState` stays testable without D3D12).
+#[cfg(windows)]
+fn with_draw_state(this: This, f: impl FnOnce(&mut crate::draw::State)) {
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    f(&mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
 /// Marks the active host list segment as having recorded GPU or deferred work.
@@ -287,6 +301,9 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    // D3D12 CreateCommandList opens with pInitialState already bound, as Reset
+    // does: remember it and log first-bind like SetPipelineState.
+    apply_initial_pipeline(pipeline);
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -316,13 +333,19 @@ fn new_list(
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
-            state.set_pipeline(pipeline);
+            state.reset(pipeline);
             std::sync::Mutex::new(state)
         },
+        #[cfg(not(windows))]
+        initial_pipeline: std::sync::atomic::AtomicUsize::new(pipeline as usize),
     });
-    #[cfg(not(windows))]
-    let _ = pipeline;
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+}
+
+/// Logs first-bind for CreateCommandList / Reset `pInitialState`, matching
+/// [`set_pipeline`].
+fn apply_initial_pipeline(pipeline: This) {
+    crate::pipeline::bound(pipeline);
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -403,15 +426,24 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             (false, false)
         }
     };
+    apply_initial_pipeline(pipeline);
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        if !fresh && !keep_pending {
-            host.reset();
-        }
-        state.reset(pipeline);
-    });
+    {
+        // Remember the PSO even when there is no host list (no D3D12 device):
+        // `with_state` alone would skip the update and leave Create's pipeline.
+        with_draw_state(this, |state| state.reset(pipeline));
+        with_state(this, |host, _| {
+            if !fresh && !keep_pending {
+                host.reset();
+            }
+        });
+    }
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    {
+        let _ = uploads;
+        list.initial_pipeline
+            .store(pipeline as usize, std::sync::atomic::Ordering::Release);
+    }
     S_OK
 }
 
@@ -791,8 +823,11 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
+            // Host-owned mapped upload (not title memory): `defer_fill` so
+            // `copy_mapped` skips the title-destination VirtualQuery guard.
+            // Wine+vkd3d can report Map memory as MEM_FREE; `defer_copy` would
+            // then skip the upload (#518). Buffer→buffer title destinations
+            // above keep `defer_copy`.
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
@@ -1312,11 +1347,16 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
-    crate::pipeline::bound(pipeline);
+    apply_initial_pipeline(pipeline);
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    with_draw_state(this, |state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
-    let _ = this;
+    {
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &*this.cast::<List>() };
+        list.initial_pipeline
+            .store(pipeline as usize, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
@@ -2005,21 +2045,24 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
-    #[cfg(windows)]
     #[test]
     fn command_list_creation_keeps_the_initial_pipeline() {
-        use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
-        use windows::core::Interface;
-
         let null = std::ptr::null();
-        let iid = ID3D12PipelineState::IID;
+        // PC ID3D12PipelineState IID — create_compute only needs a matching
+        // hand-out id; no host GPU or shader bytes are required.
+        let iid = guid(
+            0x765a30f3,
+            0xf624,
+            0x4c6f,
+            [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+        );
         // SAFETY: ComputeHead contains only raw pointers and a byte count. No
         // shader is needed to verify which pipeline object the list remembers.
         let desc: crate::pipeline::ComputeHead = unsafe { std::mem::zeroed() };
         let mut pipeline = null;
         let mut allocator = null;
         assert_eq!(
-            crate::pipeline::create_compute(null, &desc, (&raw const iid).cast(), &mut pipeline),
+            crate::pipeline::create_compute(null, &desc, &iid, &mut pipeline),
             S_OK
         );
         assert_eq!(
@@ -2033,13 +2076,18 @@ mod tests {
             barrier_batch: 0,
         };
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        let bound = |list: This| {
+        let bound = |list: This| -> This {
             // SAFETY: the test owns this live command list.
-            unsafe { &*list.cast::<List>() }
-                .state
-                .lock()
-                .unwrap()
-                .current_pipeline()
+            let list = unsafe { &*list.cast::<List>() };
+            #[cfg(windows)]
+            {
+                list.state.lock().unwrap().current_pipeline()
+            }
+            #[cfg(not(windows))]
+            {
+                list.initial_pipeline
+                    .load(std::sync::atomic::Ordering::Acquire) as This
+            }
         };
         let created_with = [false, true].map(|extended| {
             let mut list = null;
@@ -2050,14 +2098,16 @@ mod tests {
             };
             assert_eq!(hr, S_OK);
             let initial = bound(list);
-            if host_list(list).is_some() {
-                assert_eq!(close(list), S_OK);
-                assert_eq!(reset_x(list, allocator, null, 0), S_OK);
-                assert_eq!(bound(list), null);
-                assert_eq!(close(list), S_OK);
-                assert_eq!(reset(list, allocator, pipeline), S_OK);
-                assert_eq!(bound(list), pipeline);
-            }
+            assert_eq!(
+                initial, pipeline,
+                "CreateCommandList must keep pInitialState"
+            );
+            assert_eq!(close(list), S_OK);
+            assert_eq!(reset_x(list, allocator, null, 0), S_OK);
+            assert_eq!(bound(list), null);
+            assert_eq!(close(list), S_OK);
+            assert_eq!(reset(list, allocator, pipeline), S_OK);
+            assert_eq!(bound(list), pipeline);
             assert_eq!(release(list), 0);
             initial
         });

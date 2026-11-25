@@ -195,6 +195,15 @@ fn tag_end(text: &str) -> Option<usize> {
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
 
+/// Serialises tests that read or change the process title (`set_title` /
+/// `title` / package id). Hold this for the whole title-dependent sequence;
+/// `set_title` itself does not take it (the mutex is not reentrant).
+#[cfg(test)]
+pub fn title_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn set_title(title: Title) {
     *TITLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(title);
 }

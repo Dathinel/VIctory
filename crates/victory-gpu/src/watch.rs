@@ -617,6 +617,19 @@ pub fn kernel_wrote(at: usize, len: usize) {
     }
 }
 
+/// A storage worker finished writing these mapped guest pages through another
+/// view of the same section. Their address protections are still in effect.
+pub fn mapped_pages_written(addresses: impl Iterator<Item = usize>) {
+    let mut addresses = addresses.peekable();
+    if addresses.peek().is_none() {
+        return;
+    }
+    let mut g = guards();
+    for at in addresses {
+        g.clean.remove(&(at / PAGE));
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded, and kernel
 /// writes announced wholly inside it are moot (an overlapped read that
@@ -873,6 +886,10 @@ mod tests {
         let (next, clean) = writes(view + 8, end - 1, true).expect("same protected pages");
         assert!(next > first);
         assert_eq!(clean, initial);
+        mapped_pages_written(std::iter::once(view + BLOCK));
+        let (alias, updated) = writes(view, end, true).expect("alias write");
+        assert_eq!(updated, [(view / PAGE, first), (view / PAGE + 1, alias)]);
+        assert_eq!(writes(view, end, true).unwrap().1, updated);
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
@@ -894,7 +911,7 @@ mod tests {
             b"from the disk"
         );
         let (changed, pages) = writes(view, end, true).expect("kernel write visible");
-        assert_eq!(pages, [(view / PAGE, changed), (view / PAGE + 1, first)]);
+        assert_eq!(pages, [(view / PAGE, changed), (view / PAGE + 1, alias)]);
         assert_eq!(writes(view, end, true).unwrap().1, pages);
         // SAFETY: our view.
         unsafe {

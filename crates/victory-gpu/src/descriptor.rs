@@ -191,7 +191,7 @@ impl Heap {
         let start = self.start as usize;
         let end = start.saturating_add(mirrored_count as usize * step as usize);
         let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((now, pages)) = crate::watch::writes(start, end, false) {
+        let mirrored = if let Some((now, pages)) = crate::watch::writes(start, end, false) {
             let prev = *last_watch;
             let mut mirrored = 0;
             for (page, written_at) in pages {
@@ -207,10 +207,14 @@ impl Heap {
                 mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
             }
             *last_watch = now;
-            return mirrored;
-        }
-        drop(last_watch);
-        host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+            mirrored
+        } else {
+            drop(last_watch);
+            host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+        };
+        // Streamed-mip SRVs can widen without a descriptor write; remake them
+        // even when write-watch only touched other pages (or none).
+        mirrored + host.remirror_widened_srvs(self.start, step, for_draw)
     }
 }
 
@@ -350,8 +354,7 @@ impl RtvRecord {
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(false)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -359,32 +362,65 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(true)
     }
 
     /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
-    /// the title's format, which the host needs spelled out.
+    /// Without one, a typeless host copy gets a view matching the title
+    /// resource's dimension / array size / sample count in the title's
+    /// format, which the host needs spelled out.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn host_desc<T>(&self, depth: bool) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            let format = crate::resource::view_format(self.resource)?;
+            let (dim, array, samples) = crate::resource::view_shape(self.resource)?;
+            null_target_words(format, dim, array, samples, depth)?
         };
         words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
+}
+
+/// D3D12 resource dimensions (same values as the title resource description).
+const RES_TEXTURE_1D: u32 = 2;
+const RES_TEXTURE_2D: u32 = 3;
+const RES_TEXTURE_3D: u32 = 4;
+
+/// Words for a NULL-desc RTV (`depth == false`) or DSV (`depth == true`) on a
+/// typeless host copy: format, view dimension, and the union D3D12 expects
+/// for that resource shape (MSAA, array, 1D, 3D).
+fn null_target_words(
+    format: u32,
+    resource_dim: u32,
+    depth_or_array: u16,
+    samples: u32,
+    depth: bool,
+) -> Option<[u32; 6]> {
+    let array = u32::from(depth_or_array);
+    // RTV: Format, ViewDimension, then the union (no Flags).
+    // DSV: Format, ViewDimension, Flags, then the union — so array
+    // dimensions shift one word later than the matching RTV layout.
+    let (dim, w2, w3, w4, w5) = match (resource_dim, depth) {
+        (RES_TEXTURE_1D, false) if array > 1 => (3, 0, 0, array, 0), // RTV 1DARRAY
+        (RES_TEXTURE_1D, false) => (2, 0, 0, 0, 0),                  // RTV 1D
+        (RES_TEXTURE_1D, true) if array > 1 => (2, 0, 0, 0, array),  // DSV 1DARRAY
+        (RES_TEXTURE_1D, true) => (1, 0, 0, 0, 0),                   // DSV 1D
+        (RES_TEXTURE_2D, false) if samples > 1 && array > 1 => (7, 0, array, 0, 0), // RTV 2DMSARRAY
+        (RES_TEXTURE_2D, false) if samples > 1 => (6, 0, 0, 0, 0),   // RTV 2DMS
+        (RES_TEXTURE_2D, false) if array > 1 => (5, 0, 0, array, 0), // RTV 2DARRAY
+        (RES_TEXTURE_2D, false) => (4, 0, 0, 0, 0),                  // RTV 2D
+        (RES_TEXTURE_2D, true) if samples > 1 && array > 1 => (6, 0, 0, array, 0), // DSV 2DMSARRAY
+        (RES_TEXTURE_2D, true) if samples > 1 => (5, 0, 0, 0, 0),    // DSV 2DMS
+        (RES_TEXTURE_2D, true) if array > 1 => (4, 0, 0, 0, array),  // DSV 2DARRAY
+        (RES_TEXTURE_2D, true) => (3, 0, 0, 0, 0),                   // DSV 2D
+        (RES_TEXTURE_3D, false) => (8, 0, 0, array, 0),              // RTV 3D
+        _ => return None,
+    };
+    Some([format, dim, w2, w3, w4, w5])
 }
 
 /// Device method: records the view at `handle` (descriptor memory).
@@ -1033,6 +1069,63 @@ mod tests {
 
         create_cbv(std::ptr::null(), std::ptr::null(), handle);
         assert_eq!(view(handle), Some(View::Constant(0, 0)));
+    }
+
+    /// NULL-desc RTV/DSV words follow the resource shape (VIC-BT-012), not a
+    /// hardcoded TEXTURE2D. Formats are DXGI enum values used as inert labels.
+    #[test]
+    fn null_target_words_match_resource_shape() {
+        const RGBA8: u32 = 28;
+        const D32: u32 = 40;
+        // RTV: 2D, 2DMS, 2DARRAY, 2DMSARRAY, 1D, 1DARRAY, 3D.
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 1, 1, false),
+            Some([RGBA8, 4, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 1, 4, false),
+            Some([RGBA8, 6, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 4, 1, false),
+            Some([RGBA8, 5, 0, 0, 4, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 2, 4, false),
+            Some([RGBA8, 7, 0, 2, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_1D, 1, 1, false),
+            Some([RGBA8, 2, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_1D, 3, 1, false),
+            Some([RGBA8, 3, 0, 0, 3, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_3D, 5, 1, false),
+            Some([RGBA8, 8, 0, 0, 5, 0])
+        );
+        // DSV: Flags sits between ViewDimension and the union, so array
+        // sizes land one word later than the matching RTV layout.
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_2D, 1, 4, true),
+            Some([D32, 5, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_2D, 6, 1, true),
+            Some([D32, 4, 0, 0, 0, 6])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_2D, 2, 4, true),
+            Some([D32, 6, 0, 0, 2, 0])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_1D, 3, 1, true),
+            Some([D32, 2, 0, 0, 0, 3])
+        );
+        assert_eq!(null_target_words(D32, RES_TEXTURE_3D, 5, 1, true), None);
+        assert_eq!(null_target_words(RGBA8, 1, 1, 1, false), None);
     }
 
     #[test]
