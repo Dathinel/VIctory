@@ -739,6 +739,13 @@ impl State {
         if !self.bind_heaps(list, needs_root_heap) {
             return false;
         }
+        // Mirror any descriptor slots the title copied directly in heap memory
+        // before bindless texture tracking or root-table binding reads them.
+        for key in self.heaps {
+            if key != 0 {
+                crate::descriptor::heap(key as This).sync_direct_copies(true);
+            }
+        }
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -5038,5 +5045,272 @@ void main() {
             readback.Unmap(0, None);
         }
         assert_eq!(got, [2, 64, updated, updated]);
+    }
+
+    /// Direct byte copies into a shader-visible descriptor heap (bypassing
+    /// `Create*View` / `CopyDescriptors*`) are mirrored on the host so a GPU
+    /// dispatch reading that canonical slot sees the copied view rather than
+    /// a null or stale descriptor.
+    #[test]
+    fn draw_sees_descriptor_copied_directly_in_heap_memory() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC};
+        use windows::core::s;
+
+        struct DropHeap(This);
+        impl Drop for DropHeap {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+                }
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+
+        // Two distinct title buffers holding known 4-dword patterns.
+        let mut buf_a = vec![0u8; 256];
+        let mut buf_b = vec![0u8; 256];
+        let pat_a = [0x1122_3344u32, 0x5566_7788, 0xAABB_CCDD, 0xCAFE_BABE];
+        let pat_b = [0xDEAD_BEEFu32, 0x1337_C0DE, 0x0102_0304, 0xFEDC_BA98];
+        for (i, w) in pat_a.iter().enumerate() {
+            buf_a[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        for (i, w) in pat_b.iter().enumerate() {
+            buf_b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+
+        let make_placed_raw_srv = |buf: &[u8], slot_addr: u64| {
+            let base = buf.as_ptr() as u64;
+            let mut res_words = [0u32; 14];
+            res_words[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+            res_words[4] = buf.len() as u32;
+            res_words[6] = 1; // Height
+            res_words[7] = 1 | (1 << 16); // DepthOrArraySize=1, MipLevels=1
+            res_words[9] = 1; // SampleDesc.Count=1
+            res_words[11] = 1; // D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+            let raw_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: 0,
+                        NumElements: 4,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            // SAFETY: `D3D12_SHADER_RESOURCE_VIEW_DESC` is 40 bytes (`[u32; 10]`).
+            let raw_words: [u32; 10] = unsafe {
+                std::ptr::from_ref(&raw_srv)
+                    .cast::<[u32; 10]>()
+                    .read_unaligned()
+            };
+            let mut srv_words = [0u32; 16];
+            srv_words[..10].copy_from_slice(&raw_words);
+            srv_words[10] = base as u32;
+            srv_words[11] = (base >> 32) as u32;
+            crate::descriptor::create_placed_srv(
+                std::ptr::null(),
+                &res_words,
+                &srv_words,
+                slot_addr,
+            );
+        };
+
+        // Write both views into a CPU-only staging buffer (not a shader-visible heap).
+        let mut staging = [0u64; 2 * 4];
+        let stage_a = staging.as_mut_ptr() as u64;
+        let stage_b = stage_a + 32;
+        make_placed_raw_srv(&buf_a, stage_a);
+        make_placed_raw_srv(&buf_b, stage_b);
+
+        // Create a shader-visible view heap and initialize its host mirror.
+        #[repr(C)]
+        struct ExtendedHeap {
+            desc: [u32; 4],
+            placement: [u64; 2],
+        }
+        let heap_desc = ExtendedHeap {
+            desc: [0, 16, 1, 0],
+            placement: [0; 2],
+        };
+        let mut raw_heap: This = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&heap_desc).cast(),
+                &crate::object::guid(
+                    0x8efb471d,
+                    0x616c,
+                    0x4f49,
+                    [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                ),
+                &mut raw_heap,
+            ),
+            crate::object::S_OK
+        );
+        let _guard = DropHeap(raw_heap);
+        let title_heap = crate::descriptor::heap(raw_heap);
+        let host_heap = title_heap.host().expect("host view heap");
+        let target_slot = title_heap.start + 3 * 32;
+
+        // Copy `stage_a` bytes directly into slot 3 without calling any descriptor API.
+        // SAFETY: both pointers refer to live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(stage_a as *const u8, target_slot as *mut u8, 32) };
+
+        // Mirror via the submission-time sync hook and refresh backing memory.
+        crate::descriptor::sync_all_heaps();
+
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=1)), UAV(u0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, src.Load(0));
+    dst.Store(4, src.Load(4));
+    dst.Store(8, src.Load(8));
+    dst.Store(12, src.Load(12));
+}
+"#;
+        let mut blob: Option<ID3DBlob> = None;
+        // SAFETY: static shader source and entry point strings.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("draw_direct_heap_copy"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+            .unwrap();
+        }
+        let blob = blob.unwrap();
+        // SAFETY: `blob` holds valid DXBC bytes.
+        let code = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: `code` includes the root signature and compute bytecode.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root = host.device.CreateRootSignature(0, code).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+
+        let make_buf = |kind: D3D12_HEAP_TYPE, flags, state| -> ID3D12Resource {
+            let mut b: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            // SAFETY: valid committed buffer description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .unwrap();
+            }
+            b.unwrap()
+        };
+        let out = make_buf(
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        let readback = make_buf(
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+
+        let run_and_read = |backing: &[u8]| -> [u32; 4] {
+            let list = host.new_list().expect("host list");
+            if let Some(shadow) = crate::shadow::find(backing.as_ptr() as u64, backing.len() as u64)
+            {
+                shadow.refresh(&list, backing.as_ptr() as u64, backing.len() as u64);
+            }
+            // SAFETY: open list with live pipeline, host view heap, and buffers.
+            unsafe {
+                let l = &list.list;
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                l.SetComputeRootDescriptorTable(0, host_heap.gpu(3));
+                l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                l.Dispatch(1, 1, 1);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&readback, 0, &out, 0, 16);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            let mut got = [0u32; 4];
+            // SAFETY: execution completed and `readback` holds 16 bytes.
+            unsafe {
+                let range = D3D12_RANGE { Begin: 0, End: 16 };
+                readback.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+                std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), got.as_mut_ptr(), 4);
+                readback.Unmap(0, None);
+            }
+            got
+        };
+
+        assert_eq!(run_and_read(&buf_a), pat_a);
+
+        // Overwrite slot 3 directly with `stage_b` bytes and sync again.
+        // SAFETY: both pointers refer to live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(stage_b as *const u8, target_slot as *mut u8, 32) };
+        assert_eq!(title_heap.sync_direct_copies(true), 1);
+        assert_eq!(run_and_read(&buf_b), pat_b);
     }
 }

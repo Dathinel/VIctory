@@ -2,8 +2,9 @@
 //! 0007, step 3). Translated shaders index the heaps directly at the
 //! title's descriptor positions, so each host heap keeps the title heap's
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
-//! writes it (view creation and descriptor copies) and again when a draw
-//! reads it through a table and finds the slot changed.
+//! writes it (view creation and descriptor copies), when a heap is synced for
+//! direct CPU copies inside heap memory, and again when a draw reads it
+//! through a table and finds the slot changed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -469,23 +470,7 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = super::find_free_run(taken, *next as usize, n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -817,6 +802,50 @@ impl HostHeap {
             }
         }
         Some(view)
+    }
+
+    /// Scans title descriptor slots `[first, end)` and mirrors any slot whose
+    /// on-heap `(tag, view_index, generation)` differs from what the host slot
+    /// was last made from, catching descriptors the title copied directly in
+    /// heap memory without calling a descriptor method.
+    pub(crate) fn sync_slots(
+        &self,
+        start: u64,
+        step: u64,
+        first: u32,
+        end: u32,
+        for_draw: bool,
+    ) -> usize {
+        let end = end.min(self.count);
+        if first >= end || step == 0 {
+            return 0;
+        }
+        let mut changed = Vec::new();
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for index in first..end {
+                let handle = start + u64::from(index) * step;
+                // SAFETY: `[first, end)` is bounded by `self.count` (which does
+                // not exceed the title heap's descriptor count) and each
+                // descriptor slot is at least 16 bytes.
+                let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let expected = if tag == VIEW_TAG {
+                    u64::from(generation) << 32 | u64::from(i)
+                } else {
+                    0
+                };
+                if made[index as usize] != expected {
+                    changed.push(index);
+                }
+            }
+        }
+        let mut mirrored = 0;
+        for index in changed {
+            let handle = start + u64::from(index) * step;
+            self.mirror(index, handle, for_draw);
+            mirrored += 1;
+        }
+        mirrored
     }
 
     /// Updates the leaf-only live texture tracker for slot `index`.
@@ -2929,6 +2958,150 @@ mod tests {
         assert_eq!(snapshot(true, false).1, vec![copy_addr]);
         crate::descriptor::copy_simple(std::ptr::null(), 1, slot_handle(5), src_empty, 0);
         assert!(snapshot(true, false).1.is_empty());
+
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn direct_heap_byte_copies_are_mirrored_and_tracked() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let tex_a = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let tex_b = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let addr_a = tex_a.0 as usize;
+        let addr_b = tex_b.0 as usize;
+
+        let mut cpu_staging = [0u64; 2 * 4];
+        let src_a = cpu_staging.as_mut_ptr() as u64;
+        let src_b = src_a + 32;
+        crate::descriptor::create_srv(std::ptr::null(), tex_a.0, std::ptr::null(), src_a);
+        crate::descriptor::create_srv(std::ptr::null(), tex_b.0, std::ptr::null(), src_b);
+
+        // 1. Plain (non-write-watched) shader-visible heap: pre-init direct copy,
+        //    post-init direct copy, overwrite, and zero-clear.
+        let plain_heap = make_view_heap(16);
+        let plain = crate::descriptor::heap(plain_heap.0);
+        let plain_slot = |i: u32| plain.start + u64::from(i) * 32;
+
+        // Direct byte copy BEFORE `Heap::host()` exists.
+        // SAFETY: both pointers reference live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(src_a as *const u8, plain_slot(2) as *mut u8, 32) };
+        let plain_host = plain.host().expect("plain host view heap");
+        assert!(plain_host.live_texture_addrs(true, false).1.is_empty());
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert_eq!(plain_host.live_texture_addrs(true, false).1, vec![addr_a]);
+        assert_eq!(plain.sync_direct_copies(true), 0);
+
+        // Overwrite slot 2 directly with `tex_b`, then clear it to zeroes.
+        // SAFETY: both pointers reference live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(src_b as *const u8, plain_slot(2) as *mut u8, 32) };
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert_eq!(plain_host.live_texture_addrs(true, false).1, vec![addr_b]);
+
+        // SAFETY: slot 2 lies inside the live 16-slot view heap.
+        unsafe { std::ptr::write_bytes(plain_slot(2) as *mut u8, 0, 32) };
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert!(plain_host.live_texture_addrs(true, false).1.is_empty());
+
+        // 2. Write-watched placed shader-visible heap spanning two 64 KiB pages
+        //    (4096 slots * 32 bytes = 128 KiB).
+        struct WatchedMemory(*mut u8);
+        impl Drop for WatchedMemory {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: allocated by `VirtualAlloc` below.
+                    unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+                }
+            }
+        }
+        const SLOTS: u32 = 4096;
+        const BYTES: usize = SLOTS as usize * 32;
+        // SAFETY: requests a fresh zeroed 128 KiB write-watched region.
+        let mem = WatchedMemory(unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BYTES,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast()
+        });
+        assert!(!mem.0.is_null(), "VirtualAlloc(MEM_WRITE_WATCH) failed");
+
+        #[repr(C)]
+        struct PlacedDesc {
+            desc: [u32; 4],
+            placement: [u64; 2],
+        }
+        let placed = PlacedDesc {
+            desc: [0, SLOTS, 1, 0],
+            placement: [mem.0 as u64, BYTES as u64],
+        };
+        let mut raw_heap: crate::object::This = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&placed).cast(),
+                &crate::object::guid(
+                    0x8efb471d,
+                    0x616c,
+                    0x4f49,
+                    [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                ),
+                &mut raw_heap,
+            ),
+            crate::object::S_OK
+        );
+        let watched_heap = OwnedObject(raw_heap);
+        let watched = crate::descriptor::heap(watched_heap.0);
+        assert_eq!(watched.start, mem.0 as u64);
+        let watched_slot = |i: u32| watched.start + u64::from(i) * 32;
+
+        // Copy `tex_a` directly into slot 5 (page 0) before `host()` is created.
+        // SAFETY: slot 5 lies within the 4096-slot placed heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_a as *const u8, watched_slot(5) as *mut u8, 32)
+        };
+        let watched_host = watched.host().expect("watched host view heap");
+        assert_eq!(watched.sync_direct_copies(true), 1);
+        assert_eq!(watched_host.live_texture_addrs(true, false).1, vec![addr_a]);
+        // Clean sync scans zero dirty pages.
+        assert_eq!(watched.sync_direct_copies(true), 0);
+
+        // Direct copy into slot 2050 (second 64 KiB page) is picked up by `sync_all_heaps`.
+        // SAFETY: slot 2050 lies within the 4096-slot placed heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_b as *const u8, watched_slot(2050) as *mut u8, 32);
+        }
+        crate::descriptor::sync_all_heaps();
+        let mut live = watched_host.live_texture_addrs(true, false).1;
+        live.sort_unstable();
+        let mut expected = vec![addr_a, addr_b];
+        expected.sort_unstable();
+        assert_eq!(live, expected);
+        assert_eq!(watched.sync_direct_copies(true), 0);
 
         assert_eq!(host.log_messages(), None);
     }

@@ -3571,10 +3571,7 @@ impl<'a> Lower<'a> {
         if buffer_view || srv.is_some() {
             // A listed structured SRV in a table is read element by element;
             // a heap view of no listed kind is read as raw bytes.
-            let stride = srv
-                .filter(|u| u.root == RootType::Table && u.stride > 4 && u.stride.is_multiple_of(4))
-                .map(|u| u.stride)
-                .or_else(|| self.bound_structured_stride(src, false, false));
+            let stride = self.scalar_srv_stride(src, srv);
             let h = match stride {
                 Some(stride) => self.handle(site, src, false, (12, stride))?,
                 None => self.handle(site, src, false, (11, 0))?,
@@ -3727,6 +3724,13 @@ impl<'a> Lower<'a> {
         matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
     }
 
+    /// The element stride used by scalar data loads through this SRV.
+    fn scalar_srv_stride(&self, src: &Source, srv: Option<&UsedResource>) -> Option<u32> {
+        srv.filter(|u| u.root == RootType::Table && u.stride > 4 && u.stride.is_multiple_of(4))
+            .map(|u| u.stride)
+            .or_else(|| self.bound_structured_stride(src, false, false))
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         if self.atomic_descriptor_loads.contains(&site) {
             return Ok(());
@@ -3801,6 +3805,28 @@ impl<'a> Lower<'a> {
                         return Err("a constant buffer's descriptor read as data");
                     }
                     (props, None)
+                }
+                Fields::Smem { .. }
+                    if un.starts_with("s_buffer_load_dword")
+                        && used.is_some_and(|u| {
+                            u.kind == ResourceType::Srv && u.root == RootType::Table
+                        }) =>
+                {
+                    // A scalar buffer load consumes its descriptor without
+                    // reading word 2 as a count. Keep that path free of a
+                    // dimensions query unless another operand needs the count.
+                    let k = u32::from(first) + 2;
+                    if k >= count
+                        || inst
+                            .write(Reg::S(code + k as u8))
+                            .is_none_or(|v| !self.scalar_record_count_used(v))
+                    {
+                        return Err("a scalar memory read as data");
+                    }
+                    let stride = self
+                        .scalar_srv_stride(&src, used)
+                        .ok_or("a scalar memory read as data")?;
+                    ((12, stride), None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
@@ -3908,6 +3934,23 @@ impl<'a> Lower<'a> {
             b.phis.iter().any(|p| p.args.contains(&v))
                 || b.insts.iter().any(|i| {
                     !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
+    }
+
+    /// A scalar buffer load takes the whole descriptor by reference. Its
+    /// byte offset can also name one of those SGPRs, this time as a value.
+    fn scalar_record_count_used(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    if let Fields::Smem { soffset, .. } = i.fields
+                        && i.name().starts_with("s_buffer_load_dword")
+                    {
+                        return matches!(soffset, Operand::Scalar { code, .. }
+                            if i.read(Reg::S(code)) == Some(v));
+                    }
+                    i.reads.iter().any(|r| r.1 == v)
                 })
         })
     }
@@ -4054,7 +4097,24 @@ impl<'a> Lower<'a> {
             let w = load(self, at, 1)[0];
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+            let low = self.s.m.bin(c, Bin::LShr, w, sh);
+            let word = if total == 16 && self.s.m.int_value(off).is_none_or(|v| v % 4 == 3) {
+                // A halfword at byte 3 reads the low byte of the next dword.
+                // Other alignments stay within the first dword, including
+                // when it is the last word exposed by a root buffer.
+                let crosses = self.s.m.cmp(c, pred::EQ, byte, three);
+                let four = self.s.m.i32(4);
+                let next = self.s.m.bin(c, Bin::Add, at, four);
+                let addr = self.s.m.select(c, crosses, next, at);
+                let high = load(self, addr, 1)[0];
+                let eight = self.s.m.i32(8);
+                let high = self.s.m.bin(c, Bin::Shl, high, eight);
+                let combined = self.s.m.bin(c, Bin::Or, low, high);
+                self.s.m.select(c, crosses, combined, low)
+            } else {
+                low
+            };
+            vec![word]
         } else if let Some(at) = self.s.m.int_value(off) {
             if at % 4 == 0 {
                 load(self, off, total / 32)
@@ -7514,6 +7574,15 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
+        // These unformatted loads return the same register bits as the
+        // corresponding single-channel GFX10 integer formats.
+        let narrow_format = match name {
+            "buffer_load_ubyte" => Some(5),   // 8_UINT
+            "buffer_load_sbyte" => Some(6),   // 8_SINT
+            "buffer_load_ushort" => Some(11), // 16_UINT
+            "buffer_load_sshort" => Some(12), // 16_SINT
+            _ => None,
+        };
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
@@ -7522,7 +7591,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || narrow_format.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -7566,6 +7635,11 @@ impl<'a> Lower<'a> {
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+        }
+        if narrow_format.is_some()
+            && used.is_some_and(|u| u.kind == ResourceType::Cbv || u.stride > 1)
+        {
+            return Err("a byte or halfword load through a constant or structured buffer");
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
@@ -7710,7 +7784,7 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        if let Some(f) = *format {
+        if let Some(f) = format.or(narrow_format) {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
