@@ -1288,8 +1288,7 @@ impl<'a> Lower<'a> {
     }
 
     fn has_vm_export(&self, b: usize) -> bool {
-        (0..self.x.p.blocks[b].insts.len())
-            .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.vm))
+        (0..self.x.p.blocks[b].insts.len()).any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.vm))
     }
 
     /// Values of the program's input registers.
@@ -8799,14 +8798,8 @@ impl<'a> Lower<'a> {
                         );
                     } else if !self.exported[b] && !self.has_done_export(b) {
                         let t = self.s.m.bool(true);
-                        self.s.op(
-                            self.cur,
-                            "discard",
-                            Attr::NoUnwind,
-                            self.s.t.void,
-                            82,
-                            &[t],
-                        );
+                        self.s
+                            .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                     }
                 }
                 Term::Ret
