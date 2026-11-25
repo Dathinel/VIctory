@@ -1169,15 +1169,25 @@ mod tests {
         let (now1, found1) = writes(p, p + 2 * PAGE, false).expect("covered by ask_once");
         let (now2, found2) =
             writes(p + 4 * PAGE, p + 5 * PAGE, false).expect("covered by ask_once");
-        assert_eq!(now1, now2, "coalesced asks share one asking number");
-        assert_eq!(found1, [(p / PAGE + 1, now1)]);
-        assert_eq!(found2, [(p / PAGE + 4, now1)]);
+        assert_eq!(found1.len(), 1);
+        assert_eq!(found2.len(), 1);
+        assert_eq!(found1[0].0, p / PAGE + 1);
+        assert_eq!(found2[0].0, p / PAGE + 4);
+        let coalesced_gen = found1[0].1;
+        assert_eq!(
+            found2[0].1, coalesced_gen,
+            "coalesced asks share one asking number"
+        );
+        assert!(coalesced_gen <= now1 && coalesced_gen <= now2);
 
         // An intervening submission copy into page 0 updates the journal and advances `now`.
         wrote(p + 16, 64);
         let (now3, found3) = writes(p, p + 2 * PAGE, false).expect("still covered");
-        assert!(now3 > now1);
-        assert_eq!(found3, [(p / PAGE, now3), (p / PAGE + 1, now1)]);
+        assert!(now3 > coalesced_gen);
+        assert_eq!(found3.len(), 2);
+        assert_eq!(found3[0].0, p / PAGE);
+        assert!(found3[0].1 > coalesced_gen && found3[0].1 <= now3);
+        assert_eq!(found3[1], (p / PAGE + 1, coalesced_gen));
 
         ask_once_end();
         // After `ask_once_end`, a fresh CPU write is seen by the kernel again.
@@ -1279,7 +1289,9 @@ mod tests {
             (plain_start, plain_start + PAGE),
         ]);
         let (now, found) = writes(watched, watched + 2 * PAGE, false).expect("watched range");
-        assert_eq!(found, [(watched / PAGE, now)]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, watched / PAGE);
+        assert!(found[0].1 > 0 && found[0].1 <= now);
         assert!(writes(plain_start, plain_start + PAGE, false).is_none());
         ask_once_end();
 

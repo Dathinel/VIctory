@@ -1820,6 +1820,57 @@ fn concrete_format_for(
     Some(DXGI_FORMAT(concrete as i32))
 }
 
+/// Rebases a shader view of a title texture onto its host copy, which lacks
+/// the title's top `dropped` mip levels (see `resource::dropped_mips`): the
+/// level range and the minimum LOD clamp name the title's levels.
+fn drop_mips_in_srv(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+    let rebase = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        (*most, *levels) = crate::resource::rebase_mip_range(*most, *levels, dropped);
+        *clamp = (*clamp - dropped as f32).max(0.0);
+    };
+    // SAFETY: each arm reads the union member the view dimension selects.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let v = &mut desc.Anonymous.Texture2D;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let v = &mut desc.Anonymous.Texture2DArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let v = &mut desc.Anonymous.TextureCube;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let v = &mut desc.Anonymous.TextureCubeArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Synthesizes a full SRV description matching `rd` with concrete `format` when
 /// the host texture is typeless and the title passed a null description.
 fn default_srv_desc(
@@ -2054,6 +2105,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                if let Some(dsc) = desc.as_mut() {
+                    drop_mips_in_srv(dsc, crate::resource::dropped_mips(resource));
                 }
                 // A texture only part of which is mapped (streaming in):
                 // sample the mips that are there, not the zeros of the ones

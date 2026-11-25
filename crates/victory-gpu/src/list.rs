@@ -602,6 +602,25 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether a title texture's host copy lacks its top mip levels (host
+/// memory pressure). Title copies index the title's subresources and name
+/// its sizes, so they are not replayed on such a copy: its contents come
+/// from title memory instead.
+// shortcut: a copy into or out of a mip-dropped texture is skipped, so
+// what the title only ever wrote there by copy stays as detiled from its
+// memory.
+#[cfg(windows)]
+fn mip_dropped(texture: This) -> bool {
+    let dropped = crate::resource::dropped_mips(texture) > 0;
+    if dropped {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!("copy skipped: a host texture lost mips to memory pressure");
+        });
+    }
+    dropped
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -633,6 +652,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if mip_dropped(dst) || mip_dropped(src) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
@@ -709,6 +731,9 @@ extern "system" fn copy_texture_region(
             ) else {
                 return;
             };
+            if mip_dropped(src.resource) {
+                return;
+            }
             let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
                 return;
             };
@@ -809,6 +834,9 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             return;
         };
+        if mip_dropped(dst.resource) || (src.kind != FOOTPRINT && mip_dropped(src.resource)) {
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -921,6 +949,9 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if mip_dropped(dst) || mip_dropped(src) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, ID3D12GraphicsCommandList1,

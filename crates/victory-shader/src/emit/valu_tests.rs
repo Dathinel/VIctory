@@ -55,9 +55,31 @@ const fn vop3_omod(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, omod: u8)
     [w0, w1 | (omod as u32 & 3) << 27]
 }
 
+/// VOP3 with integer/float `clamp` (unsigned saturation on integer add/sub).
+const fn vop3_clamp(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, src2);
+    [w0 | 1 << 15, w1]
+}
+
+/// VOP3B (carry-out `sdst`) with `clamp`.
+const fn vop3b_clamp(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x35 << 26 | (op as u32 & 0x3FF) << 16 | 1 << 15 | (sdst as u32 & 0x7F) << 8 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
 /// VOP2 `op vdst, src0, vsrc1`.
 const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// VOP3P `op vdst, src0, src1, src2` (no modifiers; all f32 sources).
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x3FF) << 16 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
 }
 
 /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
@@ -755,6 +777,42 @@ fn f32_to_f16_rounds_to_nearest_even() {
             );
         },
     );
+}
+
+#[test]
+fn write_f_omod_flushes_neg_zero() {
+    // v_add_f32_e64 v0, v1, v2 with omod: RDNA2 flushes -0.0 after the scale.
+    // VOP3 opcode 0x103 = VOP2 v_add_f32 (0x003) at the VOP2-in-VOP3 base.
+    let f = f32::to_bits;
+    let nz = f(-0.0);
+    let pz = f(0.0);
+    for (omod, scale) in [(1u8, 2.0f32), (2, 4.0), (3, 0.5)] {
+        let shader = build_valu_cs(&vop3_omod(0x103, 0, vgpr(1), vgpr(2), 0, omod));
+        let cases: &[([u32; 4], u32)] = &[
+            // -0 + -0 = -0; omod must yield +0, not IEEE -0.
+            ([nz, nz, 0, 0], pz),
+            ([pz, pz, 0, 0], pz),
+            ([f(1.0), f(1.0), 0, 0], f(2.0 * scale)),
+            ([f(-1.0), f(0.0), 0, 0], f(-scale)),
+        ];
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: v_add_f32 omod={omod}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1]
+            );
+        });
+    }
+    // Without omod, -0 + -0 stays -0.
+    let plain = build_valu_cs(&vop3(0x103, 0, vgpr(1), vgpr(2), 0));
+    run_cases(&plain, &[[nz, nz, 0, 0]], |backend, _, _, got| {
+        assert_eq!(
+            got, nz,
+            "{backend}: v_add_f32(-0, -0) without omod must keep -0 ({got:#010x})"
+        );
+    });
 }
 
 #[test]
@@ -1632,6 +1690,50 @@ fn cmp16_ignores_op_sel_as_rdna2_does() {
     );
 }
 
+/// `v_fma_mixlo_f16` / `v_fma_mixhi_f16` round the exact `a*b + c` once to
+/// binary16 (VIC-BT-041). An f32 FMA then `legacyF32ToF16` double-rounds the
+/// midpoint-tie class below to the even half.
+#[test]
+fn fma_mix_f16_single_rounds_midpoint_ties() {
+    let f = f32::to_bits;
+    // 1*1 + (2^-11 + 1 ulp): exact sits just above the 1 + 2^-11 midpoint.
+    let c = 0x3A00_0001u32;
+    // 2^-11 - 2^-30: exact sits just below the same midpoint.
+    let c_below = f(2.0f32.powi(-11) - 2.0f32.powi(-30));
+    let cases: &[([u32; 4], u32)] = &[
+        ([f(1.0), f(1.0), c, 0], 0x3C01),
+        ([f(-1.0), f(1.0), c | 0x8000_0000, 0], 0xBC01),
+        ([f(2.0), f(0.5), c, 0], 0x3C01),
+        ([f(1.0), f(1.0), c_below, 0], 0x3C00),
+        ([f(-1.0), f(1.0), c_below | 0x8000_0000, 0], 0xBC00),
+        ([f(2.0), f(0.5), c_below, 0], 0x3C00),
+        // Ordinary fused multiply-add still lands on the exact half.
+        ([f(2.0), f(3.0), f(1.0), 0], 0x4700), // 7.0
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    // v_fma_mixlo_f16 v0, v1, v2, v3
+    let lo = build_valu_cs(&vop3p(0x021, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&lo, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got as u16, want as u16,
+            "{backend}: v_fma_mixlo_f16 case {i} = {got:#06x}, want {want:#06x}"
+        );
+    });
+    // High half: seed v0's low half and check the result lands in bits 31:16.
+    let mut body = vec![vop1(0x001, 0, 255)]; // v_mov_b32 v0, lit
+    body.push(0x1234_5678);
+    body.extend_from_slice(&vop3p(0x022, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let hi = build_valu_cs(&body);
+    run_cases(&hi, &inputs, |backend, i, _, got| {
+        let want = cases[i].1 << 16 | 0x5678;
+        assert_eq!(
+            got, want,
+            "{backend}: v_fma_mixhi_f16 case {i} = {got:#010x}, want {want:#010x}"
+        );
+    });
+}
+
 #[test]
 fn cmp16_sdwa_preserves_word_selects() {
     // llvm-mc -mcpu=gfx1030: v_cmp_lt_{f16,i16,u16}_sdwa vcc_lo, v1, v2.
@@ -1720,6 +1822,53 @@ fn v_mad_f32_flushes_subnormals_around_omod() {
         (&mad_mul2, mad_mul2_cases, "v_mad_f32 mul:2"),
         (&mad_div2, mad_div2_cases, "v_mad_f32 div:2"),
         (&mac, mac_cases, "v_mac_f32"),
+    ] {
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(shader, &inputs, |backend, i, _, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
+/// VOP3 integer `clamp` saturates unsigned add/sub on overflow/underflow
+/// (VIC-BT-010). Without the fix these refuse to lower, or wrap.
+#[test]
+fn integer_vop3_clamp_saturates_add_and_sub() {
+    // VOP2 ops in VOP3 encoding use opcode + 0x100 (0x025 alone is VOPC).
+    // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32 with clamp.
+    let add_nc = build_valu_cs(&vop3_clamp(0x125, 0, vgpr(1), vgpr(2), 0));
+    let sub_nc = build_valu_cs(&vop3_clamp(0x126, 0, vgpr(1), vgpr(2), 0));
+    let subrev_nc = build_valu_cs(&vop3_clamp(0x127, 0, vgpr(1), vgpr(2), 0));
+    // v_add_co_u32 / v_sub_co_u32 with clamp (carry → s16, unused).
+    let add_co = build_valu_cs(&vop3b_clamp(0x30f, 0, 16, vgpr(1), vgpr(2), 0));
+    let sub_co = build_valu_cs(&vop3b_clamp(0x310, 0, 16, vgpr(1), vgpr(2), 0));
+
+    let add_cases: &[([u32; 4], u32)] = &[
+        ([1, 2, 0, 0], 3),
+        ([u32::MAX, 1, 0, 0], u32::MAX),
+        ([0x8000_0000, 0x8000_0000, 0, 0], u32::MAX),
+        ([0, 0, 0, 0], 0),
+    ];
+    let sub_cases: &[([u32; 4], u32)] = &[
+        ([5, 3, 0, 0], 2),
+        ([1, 2, 0, 0], 0),
+        ([0, 1, 0, 0], 0),
+        ([u32::MAX, u32::MAX, 0, 0], 0),
+    ];
+    // subrev: dst = src1 - src0 (v2 - v1).
+    let subrev_cases: &[([u32; 4], u32)] =
+        &[([3, 5, 0, 0], 2), ([2, 1, 0, 0], 0), ([1, 0, 0, 0], 0)];
+
+    for (shader, cases, what) in [
+        (&add_nc, add_cases, "v_add_nc_u32 clamp"),
+        (&sub_nc, sub_cases, "v_sub_nc_u32 clamp"),
+        (&subrev_nc, subrev_cases, "v_subrev_nc_u32 clamp"),
+        (&add_co, add_cases, "v_add_co_u32 clamp"),
+        (&sub_co, sub_cases, "v_sub_co_u32 clamp"),
     ] {
         let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
         run_cases(shader, &inputs, |backend, i, _, got| {
