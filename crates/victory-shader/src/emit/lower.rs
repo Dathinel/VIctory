@@ -88,12 +88,25 @@ pub(crate) fn lower_with_wave32(
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false, allow_wave32, pixel_inputs, view_stride) {
+    // A failed optional lowering must preserve the ordinary translation (and its
+    // refusal reason, if any). First try the two-register-bank form only for a
+    // single complete, straight-line 64-lane compute wave.
+    if allow_wave32
+        && parts.native.wave64
+        && matches!(parts.native.io, StageIo::Cs(cs) if cs.threads == [64, 1, 1])
+        && double_lanes_enabled()
+        && can_double_lane_reads(parts.p)
+        && let Ok(shader) =
+            lower_program(parts, false, allow_wave32, true, pixel_inputs, view_stride)
+    {
+        return Ok(shader);
+    }
+    match lower_program(parts, false, allow_wave32, false, pixel_inputs, view_stride) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => {
-            lower_program(parts, true, allow_wave32, pixel_inputs, view_stride)
+            lower_program(parts, true, allow_wave32, false, pixel_inputs, view_stride)
         }
         result => result,
     }
@@ -103,12 +116,21 @@ fn lower_program(
     parts: &Parts,
     numeric_selects: bool,
     allow_wave32: bool,
+    doubled_lane_reads: bool,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects, allow_wave32, view_stride).run(pixel_inputs)
+        match Lower::new(
+            parts,
+            &bad,
+            numeric_selects,
+            allow_wave32,
+            doubled_lane_reads,
+            view_stride,
+        )
+        .run(pixel_inputs)
         {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -242,6 +264,7 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    doubled_lane_reads: bool,
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
     numeric_selects: bool,
@@ -474,12 +497,97 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// A full, unpredicated console wave that communicates only by indexed register
+/// reads or dword LDS accesses. Scalar memory and descriptor operands stay
+/// uniform. Each thread keeps both logical lanes in registers and can
+/// broadcast either without reserving any of the program's LDS.
+fn can_double_lane_reads(p: &Program) -> bool {
+    let [block] = p.blocks.as_slice() else {
+        return false;
+    };
+    if block.exit != Exit::End || !block.phis.is_empty() {
+        return false;
+    }
+    let mut lane_read = false;
+    for inst in &block.insts {
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Valu(v) => {
+                if v.abs != 0
+                    || v.neg != 0
+                    || v.clamp
+                    || v.omod != 0
+                    || v.dpp.is_some()
+                    || v.sdwa.is_some()
+                    || !matches!(
+                        name,
+                        "v_readlane_b32"
+                            | "v_mov_b32"
+                            | "v_add_nc_u32"
+                            | "v_lshlrev_b32"
+                            | "v_lshrrev_b32"
+                            | "v_and_b32"
+                            | "v_or_b32"
+                            | "v_xor_b32"
+                    )
+                {
+                    return false;
+                }
+                if name == "v_readlane_b32" {
+                    if !matches!(v.dst, Some(Operand::Scalar { code: 0..=105, .. }))
+                        || !matches!(
+                            v.src.get(1),
+                            Some(
+                                Operand::Scalar { code: 0..=105, .. }
+                                    | Operand::Const(128..=248)
+                                    | Operand::Literal(_)
+                            )
+                        )
+                    {
+                        return false;
+                    }
+                    lane_read = true;
+                }
+            }
+            Fields::Sop {
+                dst: Some(Operand::Scalar { code: 0..=105, .. }),
+                ..
+            } if name == "s_mov_b32" => {}
+            Fields::Smem { .. }
+                if name == "s_load_dwordx4"
+                    && inst
+                        .writes
+                        .iter()
+                        .all(|(reg, _)| matches!(reg, Reg::S(0..=105))) => {}
+            Fields::Buffer { .. } if name == "buffer_store_dword" => {}
+            Fields::Ds { gds: false, .. } if matches!(name, "ds_read_b32" | "ds_write_b32") => {}
+            Fields::Sopp { .. } if matches!(name, "s_waitcnt" | "s_endpgm") => {}
+            _ => return false,
+        }
+    }
+    lane_read
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DOUBLE_LANES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn double_lanes_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(value) = TEST_DOUBLE_LANES.get() {
+        return value;
+    }
+    super::wave64_double()
+}
+
 impl<'a> Lower<'a> {
     fn new(
         x: &'a Parts<'a>,
         bad: &'a HashMap<Value, Why>,
         numeric_selects: bool,
         allow_wave32: bool,
+        doubled_lane_reads: bool,
         view_stride: Option<ViewStride<'a>>,
     ) -> Self {
         let p = x.p;
@@ -556,7 +664,10 @@ impl<'a> Lower<'a> {
                 && s.lds_dwords == 0
                 && !masks_held
                 && super::wave::single_wave32_reductions(p);
-            if one_wave32 {
+            if doubled_lane_reads {
+                s.threads = Some([32, 1, 1]);
+                s.wave_size = Some(32);
+            } else if one_wave32 {
                 s.wave_size = Some(32);
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -648,6 +759,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            doubled_lane_reads,
             numeric_selects,
             flat: None,
             no_barrier,
@@ -1159,17 +1271,22 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
-            let mut i = 0;
-            while i < p.blocks[b].insts.len() {
-                self.inst(b, i)?;
-                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
-                    for j in i + 1..end {
-                        self.section_inst(b, j, i);
+            if self.doubled_lane_reads {
+                self.doubled_reads_block(b)?;
+            } else {
+                let mut i = 0;
+                while i < p.blocks[b].insts.len() {
+                    self.inst(b, i)?;
+                    if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end)
+                    {
+                        for j in i + 1..end {
+                            self.section_inst(b, j, i);
+                        }
+                        i = end;
+                        continue;
                     }
-                    i = end;
-                    continue;
+                    i += 1;
                 }
-                i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -1208,6 +1325,74 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             has_fcmp_uno,
         })
+    }
+
+    /// Lower the straight-line block admitted by `can_double_lane_reads`.
+    /// Host lane i owns both console lanes i and i + 32. Scalar instructions
+    /// execute once, vector instructions consume and write each register bank.
+    fn doubled_reads_block(&mut self, b: usize) -> Result<(), Stop> {
+        self.s.flags |= flags::WAVE_OPS;
+        let mut upper = self.vals.clone();
+        for &(v, input) in &self.x.io.inputs {
+            if matches!(input, Input::ThreadIdInGroup(0)) {
+                let lane = self.lane_index();
+                let offset = self.s.m.i32(32);
+                let high_id = self.s.m.bin(self.cur, Bin::Add, lane, offset);
+                upper.insert(v, Val::I32(high_id));
+            }
+        }
+        for (i, inst) in self.x.p.blocks[b].insts.iter().enumerate() {
+            if inst.name() == "v_readlane_b32" {
+                let offset = inst.machine.offset;
+                let lo = self.src(inst, 0).map_err(|why| unsupported(offset, why))?;
+                let lane = self.src(inst, 1).map_err(|why| unsupported(offset, why))?;
+                std::mem::swap(&mut self.vals, &mut upper);
+                let hi = self.src(inst, 0).map_err(|why| unsupported(offset, why))?;
+                std::mem::swap(&mut self.vals, &mut upper);
+                let mask = self.s.m.i32(31);
+                let at = self.s.m.bin(self.cur, Bin::And, lane, mask);
+                let lo = self.read_lane(lo, at);
+                let hi = self.read_lane(hi, at);
+                let bit = self.s.m.i32(32);
+                let half = self.s.m.bin(self.cur, Bin::And, lane, bit);
+                let zero = self.s.m.i32(0);
+                let high = self.s.m.cmp(self.cur, pred::NE, half, zero);
+                let value = self.s.m.select(self.cur, high, hi, lo);
+                for &(_, dst) in &inst.writes {
+                    self.vals.insert(dst, Val::I32(value));
+                    upper.insert(dst, Val::I32(value));
+                }
+            } else if matches!(
+                inst.fields,
+                Fields::Valu(_) | Fields::Buffer { .. } | Fields::Ds { .. }
+            ) {
+                self.inst(b, i)?;
+                std::mem::swap(&mut self.vals, &mut upper);
+                self.inst(b, i)?;
+                std::mem::swap(&mut self.vals, &mut upper);
+                if matches!(inst.fields, Fields::Ds { .. }) {
+                    // Both halves must finish this LDS instruction before the
+                    // next can overwrite or consume another lane's result.
+                    let mode = self.s.m.i32(9); // group sync and groupshared fence
+                    self.s.op(
+                        self.cur,
+                        "barrier",
+                        Attr::NoDuplicate,
+                        self.s.t.void,
+                        80,
+                        &[mode],
+                    );
+                }
+            } else {
+                self.inst(b, i)?;
+                for &(_, dst) in &inst.writes {
+                    if let Some(&value) = self.vals.get(&dst) {
+                        upper.insert(dst, value);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -10006,6 +10191,16 @@ mod wave_size_tests {
         rsrc2_extra: u32,
         allow_wave32: bool,
     ) -> (super::super::HostShader, (u32, u32)) {
+        compile_wave64_cs_threads(words, threads, rsrc2_extra, allow_wave32, threads)
+    }
+
+    fn compile_wave64_cs_threads(
+        words: &[u32],
+        threads: [u32; 3],
+        rsrc2_extra: u32,
+        allow_wave32: bool,
+        expected_threads: [u32; 3],
+    ) -> (super::super::HostShader, (u32, u32)) {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: true,
@@ -10063,7 +10258,7 @@ mod wave_size_tests {
             u32::from_le_bytes(psv[44..48].try_into().unwrap()),
             u32::from_le_bytes(psv[48..52].try_into().unwrap()),
         ];
-        assert_eq!(psv_threads, threads);
+        assert_eq!(psv_threads, expected_threads);
         (shader, (min_wave, max_wave))
     }
 
@@ -10174,6 +10369,63 @@ mod wave_size_tests {
             out.push((label, res[0].clone()));
         }
         out
+    }
+
+    #[test]
+    fn doubled_lane_reads_broadcast_registers_from_both_halves_without_scratch_lds() {
+        // Each lane writes tid + 1 near the end of the 32 KiB LDS allocation
+        // and reads its opposite half. Sum registers from lanes 31 and 63,
+        // then add the cross-half LDS result. Every output tests both paths.
+        let mut words = vec![
+            0xBE81_0380,
+            0xF408_0200,
+            0xFA00_0000, // load UAV descriptor
+            0x340C_0082, // v_lshlrev_b32 v6, 2, v0 (byte address)
+            0x4A0E_0081, // v_add_nc_u32 v7, 1, v0
+            0xD760_0002,
+            0x0001_3F07, // v_readlane_b32 s2, v7, 31
+            0xD760_0003,
+            0x0001_7F07, // v_readlane_b32 s3, v7, 63
+            0x7E0A_0203, // v_mov_b32 v5, s3
+            0x4A08_0A02, // v_add_nc_u32 v4, s2, v5
+            0xD834_7F00,
+            0x0000_0706, // ds_write_b32 v6, v7 offset:32512
+            0x3A00_00A0, // v_xor_b32 v0, 32, v0
+            0x3400_0082, // v_lshlrev_b32 v0, 2, v0
+            0xD8D8_7F00,
+            0x0500_0000, // ds_read_b32 v5, v0 offset:32512
+            0x4A08_0905, // v_add_nc_u32 v4, v5, v4
+            0xE070_1000,
+            0x8002_0406, // buffer_store_dword v4, v6
+            S_ENDPGM,
+        ];
+        let full_lds = 64 << 15;
+        let group = [64, 1, 1];
+        super::TEST_DOUBLE_LANES.set(Some(false));
+        let (_, off) = compile_wave64_cs_mode(&words, group, full_lds, true);
+        assert_eq!(off, (64, 64));
+        super::TEST_DOUBLE_LANES.set(Some(true));
+        let (_, native) = compile_wave64_cs_mode(&words, group, full_lds, false);
+        assert_eq!(native, (64, 64));
+        let (shader, doubled) =
+            compile_wave64_cs_threads(&words, group, full_lds, true, [32, 1, 1]);
+        assert_eq!(doubled, (32, 32));
+        #[cfg(windows)]
+        for (host, result) in run_cs_uav(&shader, 64) {
+            assert_eq!(
+                result,
+                (0..64).map(|lane| 97 + (lane ^ 32)).collect::<Vec<_>>(),
+                "{host}"
+            );
+            eprintln!("{host}: read back all 64 logical lanes");
+        }
+        #[cfg(not(windows))]
+        let _ = shader;
+        // Inter-thread state is outside the straight-line indexed-read proof.
+        words.insert(words.len() - 1, 0xBF8A_0000); // s_barrier
+        let (_, with_barrier) = compile_wave64_cs_mode(&words, group, full_lds, true);
+        assert_eq!(with_barrier, (64, 64));
+        super::TEST_DOUBLE_LANES.set(None);
     }
 
     #[test]
