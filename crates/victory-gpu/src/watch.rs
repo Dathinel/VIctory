@@ -1092,8 +1092,13 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
     }
 
+    /// Serializes tests that drive the process-wide `ask_once` journal state
+    /// (`JOURNAL.ahead` / `j.kept` / `j.asked`).
+    static ASK_ONCE_TEST: Mutex<()> = Mutex::new(());
+
     #[test]
     fn ask_once_coalesces_ranges_and_surfaces_intervening_wrote() {
+        let _serial = ASK_ONCE_TEST.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation, freed after cleaning up.
         let p = unsafe {
             VirtualAlloc(
@@ -1142,19 +1147,20 @@ mod tests {
         assert!(now4 > now3);
         assert_eq!(found4, [(p / PAGE + 5, now4)]);
 
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         {
             let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
             for page in p / PAGE..(p + 6 * PAGE) / PAGE {
                 j.written.remove(&page);
             }
         }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]
     fn a_file_read_after_the_submission_query_reaches_every_reader() {
         use std::io::{Read, Seek, Write};
+        let _serial = ASK_ONCE_TEST.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: allocate a writable page and release it after all reads.
         let at = unsafe {
             VirtualAlloc(
@@ -1195,12 +1201,17 @@ mod tests {
             }
             ask_once_end();
         }
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            j.written.remove(&(at / PAGE));
+        }
         // SAFETY: the reservation is ours.
         unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
     }
 
     #[test]
     fn ask_once_handles_mixed_watched_and_unwatched_ranges() {
+        let _serial = ASK_ONCE_TEST.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation.
         let watched = unsafe {
             VirtualAlloc(
@@ -1232,14 +1243,14 @@ mod tests {
         assert!(writes(plain_start, plain_start + PAGE, false).is_none());
         ask_once_end();
 
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(watched as *mut _, 0, MEM_RELEASE) };
         {
             let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
             for page in watched / PAGE..(watched + 2 * PAGE) / PAGE {
                 j.written.remove(&page);
             }
         }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(watched as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]
