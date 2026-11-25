@@ -49,6 +49,8 @@ mod indirect;
 #[cfg(test)]
 mod indirect_budget;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -78,4 +80,4 @@ mod watch;
 #[cfg(windows)]
 pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory};
 #[cfg(windows)]
-pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped};
+pub use watch::{kernel_will_write, kernel_wrote, mapped_pages_written, title_memory_remapped};
