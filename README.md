@@ -72,6 +72,8 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`). On Linux, see
 [docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
 natively today, cross-building `victory.exe` and running it under Proton.
+For Windows 10 runtime setup, adapter selection, and GPU troubleshooting, see
+[docs/windows-gpu-support.md](docs/windows-gpu-support.md).
 
 Under Wine or Proton, builds without embedded helper shaders also need DXC's
 `dxcompiler.dll` (with its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile
