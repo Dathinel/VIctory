@@ -1012,17 +1012,18 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data, rebar_bytes) = alloc_shadow_buffer(len)?;
+    // Keep unbounded loose 4 MiB windows in system memory so they cannot
+    // starve registered title buffers out of the bounded ReBAR budget.
+    let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
-        rebar = rebar_bytes.is_some(),
         "loose memory copied to the host"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, rebar_bytes));
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, None));
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
