@@ -2507,3 +2507,70 @@ fn xma_integer_log2_matches_the_formats_function() {
         assert_eq!(got, want, "{backend}: log2({:#x})", inputs[0]);
     });
 }
+
+/// `victory_formats::texture::dim`, one of the two functions the test below runs as
+/// console code.
+fn texture_dim_reference(texels: u32, mip: u32, block: u32) -> u32 {
+    (texels >> mip).max(1).div_ceil(block)
+}
+
+/// `victory_formats::texture::padded_dim`, the other one.
+fn texture_padded_dim_reference(texels: u32, mip: u32, block: u32) -> u32 {
+    texels.max(1).div_ceil(block).div_ceil(1 << mip)
+}
+
+/// A mip's size in elements, as data sees it and as placement pads it, written as console
+/// code, matches the formats crate's two functions on the GPU for texel and compressed
+/// block sizes. The block is a power of two, so each division is a shift.
+#[test]
+fn texture_mip_sizes_match_the_formats_functions() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = texels, v2 = the mip, v3 = the block, v4 = which size. v5 = the block's shift,
+    // v6 = the block less one.
+    body.push(vop1(0x03A, 5, vgpr(3))); // v_ffbl_b32 v5, v3
+    body.extend(vop3(0x125, 6, 193, vgpr(3), 128)); // v_add_nc_u32 v6, -1, v3
+    // As data sees it: halve rounding down, at least one, round up to whole elements.
+    body.extend(vop3(0x116, 7, vgpr(2), vgpr(1), 128)); // v_lshrrev_b32 v7, v2, v1
+    body.extend(vop3(0x114, 7, vgpr(7), 129, 128)); // v_max_u32 v7, v7, 1
+    body.extend(vop3(0x125, 7, vgpr(7), vgpr(6), 128)); // v_add_nc_u32 v7, v7, v6
+    body.extend(vop3(0x116, 7, vgpr(5), vgpr(7), 128)); // v_lshrrev_b32 v7, v5, v7
+    // As placement pads it: mip 0's elements, halved rounding up.
+    body.extend(vop3(0x114, 8, vgpr(1), 129, 128)); // v_max_u32 v8, v1, 1
+    body.extend(vop3(0x125, 8, vgpr(8), vgpr(6), 128)); // v_add_nc_u32 v8, v8, v6
+    body.extend(vop3(0x116, 8, vgpr(5), vgpr(8), 128)); // v_lshrrev_b32 v8, v5, v8
+    body.extend(vop3(0x11A, 9, vgpr(2), 129, 128)); // v_lshlrev_b32 v9, v2, 1
+    body.extend(vop3(0x125, 9, 193, vgpr(9), 128)); // v_add_nc_u32 v9, -1, v9
+    body.extend(vop3(0x125, 8, vgpr(8), vgpr(9), 128)); // v_add_nc_u32 v8, v8, v9
+    body.extend(vop3(0x116, 8, vgpr(2), vgpr(8), 128)); // v_lshrrev_b32 v8, v2, v8
+    body.extend(vop3(0x0C5, 106, 128, vgpr(4), 128)); // v_cmp_ne_u32 vcc, 0, v4
+    body.extend(vop3(0x101, 0, vgpr(7), vgpr(8), vcc)); // v_cndmask_b32 v0, v7, v8, vcc
+    let shader = build_valu_cs(&body);
+    let mut cases = Vec::new();
+    for texels in [0u32, 1, 2, 3, 5, 8, 9, 100, 255, 257, 4096, 16383] {
+        for mip in [0u32, 1, 2, 3, 5, 13] {
+            for block in [1u32, 4] {
+                cases.extend([[texels, mip, block, 0], [texels, mip, block, 1]]);
+            }
+        }
+    }
+    // The two sizes must differ somewhere, or the test could not tell them apart.
+    assert!(cases.iter().any(|&[t, m, b, _]| {
+        texture_dim_reference(t, m, b) != texture_padded_dim_reference(t, m, b)
+    }));
+    run_cases(
+        &shader,
+        &cases,
+        |backend, _, [texels, mip, block, padded], got| {
+            let want = if padded == 0 {
+                texture_dim_reference(texels, mip, block)
+            } else {
+                texture_padded_dim_reference(texels, mip, block)
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: {texels} texels, mip {mip}, block {block}, padded {padded}"
+            );
+        },
+    );
+}
